@@ -4,6 +4,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+import pytest
+
 from tne_sdk.llm.providers import (
     AnthropicProvider,
     OpenAICompatibleProvider,
@@ -164,3 +166,45 @@ class TestOpenAIProviderRequest:
         monkeypatch.setattr("tne_sdk.llm.providers.inspect.signature", no_signature)
         kept = provider._supported_kwargs({"top_k": 20, "presence_penalty": 1.5, "seed": 7})
         assert kept == {"presence_penalty": 1.5, "seed": 7}
+
+
+# ── Timeouts ─────────────────────────────────────────────────────────────── #
+
+class TestTimeouts:
+    """llm_timeout must bound a call on every provider, with no hidden retries."""
+
+    def test_openai_provider_uses_the_timeout_and_one_attempt(self):
+        provider = provider_from_profile(
+            {"llm_url": "https://api.openai.com/v1", "llm_api_key": "sk-test", "model": "gpt-4o"},
+            timeout=45.0,
+        )
+        assert provider._client.timeout == 45.0
+        assert provider._client.max_retries == 0
+
+    def test_anthropic_provider_uses_the_timeout_and_one_attempt(self):
+        provider = provider_from_profile(
+            {"llm_url": "https://api.anthropic.com/v1", "llm_api_key": "sk-ant-test", "model": "m"},
+            timeout=45.0,
+        )
+        assert provider._client.timeout == 45.0
+        assert provider._client.max_retries == 0
+
+    def test_default_is_two_minutes_everywhere(self):
+        assert OpenAIProvider(api_key="sk-test")._client.timeout == 120.0
+        assert AnthropicProvider(api_key="sk-ant-test")._client.timeout == 120.0
+        assert OpenAICompatibleProvider(base_url="http://localhost:1/v1")._timeout == 120.0
+
+    def test_a_slow_openai_call_fails_once_instead_of_retrying(self):
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            raise httpx.ReadTimeout("too slow", request=request)
+
+        provider = OpenAIProvider(api_key="sk-test", timeout=5.0)
+        provider._client = provider._client.with_options(
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        with pytest.raises(openai.APITimeoutError):
+            provider.chat_completion([Message("user", "u")])
+        assert len(calls) == 1

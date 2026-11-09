@@ -53,6 +53,14 @@ class LLMProvider(ABC):
         """Release any underlying resources. No-op unless overridden."""
 
 
+DEFAULT_TIMEOUT = 120.0
+
+# The vendor clients retry a failed call by themselves (twice by default), so a
+# timeout of T could hold a turn for 3 x T. A turn has one tick to answer in:
+# providers here make one attempt, and the agent decides what to do on failure.
+_MAX_RETRIES = 0
+
+
 # Sampling params local servers accept but the official OpenAI API does not.
 # Used only if the openai client's create() signature cannot be read.
 _NON_OPENAI_PARAMS = frozenset({
@@ -64,13 +72,20 @@ _NON_OPENAI_PARAMS = frozenset({
 class OpenAIProvider(LLMProvider):
     """LLM Provider for the official OpenAI API."""
 
-    def __init__(self, api_key: str | None = None, default_model: str = "gpt-4o") -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        default_model: str = "gpt-4o",
+        timeout: float = DEFAULT_TIMEOUT,
+    ) -> None:
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY") or ""
         if not self.api_key:
             raise ValueError(
                 "OpenAI API key not provided or found in OPENAI_API_KEY environment variable."
             )
-        self._client = _openai_sdk.OpenAI(api_key=self.api_key)
+        self._client = _openai_sdk.OpenAI(
+            api_key=self.api_key, timeout=timeout, max_retries=_MAX_RETRIES,
+        )
         self.default_model = default_model
         self._dropped_params: set[str] = set()
         self._is_supported: Callable[[str], bool] | None = None
@@ -133,13 +148,16 @@ class AnthropicProvider(LLMProvider):
         self,
         api_key: str | None = None,
         default_model: str = "claude-sonnet-4-6",
+        timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY") or ""
         if not self.api_key:
             raise ValueError(
                 "Anthropic API key not provided or found in ANTHROPIC_API_KEY environment variable."
             )
-        self._client = _anthropic_sdk.Anthropic(api_key=self.api_key)
+        self._client = _anthropic_sdk.Anthropic(
+            api_key=self.api_key, timeout=timeout, max_retries=_MAX_RETRIES,
+        )
         self.default_model = default_model
 
     def chat_completion(
@@ -194,7 +212,7 @@ class OpenAICompatibleProvider(LLMProvider):
         base_url: str,
         api_key: str = "not-needed",
         default_model: str = "local-model",
-        timeout: float = 120.0,
+        timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
         if not base_url:
             raise ValueError("base_url must be provided for OpenAICompatibleProvider.")
@@ -256,7 +274,7 @@ class OpenAICompatibleProvider(LLMProvider):
 
 # ── Provider factory ──────────────────────────────────────────────────────── #
 
-def provider_from_profile(profile: dict[str, Any], timeout: float = 120.0) -> LLMProvider:
+def provider_from_profile(profile: dict[str, Any], timeout: float = DEFAULT_TIMEOUT) -> LLMProvider:
     """
     Auto-select the right LLM provider from a profile dict.
 
@@ -273,6 +291,7 @@ def provider_from_profile(profile: dict[str, Any], timeout: float = 120.0) -> LL
     ``llm_api_key`` is passed through to whichever provider is selected.
     For Anthropic/OpenAI it falls back to the standard env vars
     (ANTHROPIC_API_KEY / OPENAI_API_KEY) if the profile key is empty.
+    ``timeout`` (seconds) bounds every LLM call, whichever provider is selected.
     For Bedrock, authentication uses the boto3 credential chain (env vars,
     IAM role, ~/.aws/credentials).
     """
@@ -288,16 +307,19 @@ def provider_from_profile(profile: dict[str, Any], timeout: float = 120.0) -> LL
             model_id          = model,
             region            = region,
             default_max_tokens = int(profile.get("max_tokens", 1024)),
+            timeout           = timeout,
         )
     if "anthropic.com" in url:
         return AnthropicProvider(
             api_key       = key or None,   # falls back to ANTHROPIC_API_KEY env var
             default_model = model,
+            timeout       = timeout,
         )
     if "openai.com" in url:
         return OpenAIProvider(
             api_key       = key or None,   # falls back to OPENAI_API_KEY env var
             default_model = model,
+            timeout       = timeout,
         )
     return OpenAICompatibleProvider(
         base_url      = profile.get("llm_url", ""),

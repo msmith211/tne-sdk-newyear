@@ -1,7 +1,7 @@
 """Tests for BedrockProvider construction and provider_from_profile routing."""
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
@@ -44,7 +44,7 @@ class TestBedrockProviderConstruction:
             )
             assert provider.model_id == "mistral.ministral-3-8b-instruct"
             mock_boto3.client.assert_called_once_with(
-                "bedrock-runtime", region_name="us-west-2"
+                "bedrock-runtime", region_name="us-west-2", config=ANY,
             )
 
     def test_explicit_credentials_forwarded(self):
@@ -67,6 +67,7 @@ class TestBedrockProviderConstruction:
                 aws_access_key_id="AKIA_TEST",
                 aws_secret_access_key="secret_test",
                 aws_session_token="token_test",
+                config=ANY,
             )
 
     def test_default_credential_chain_when_no_keys(self):
@@ -78,8 +79,21 @@ class TestBedrockProviderConstruction:
             importlib.reload(bedrock)
             bedrock.BedrockProvider(model_id="test-model")
             mock_boto3.client.assert_called_once_with(
-                "bedrock-runtime", region_name="us-east-1"
+                "bedrock-runtime", region_name="us-east-1", config=ANY,
             )
+
+    def test_timeout_is_applied_and_retries_are_off(self):
+        """A call must never run longer than the timeout the agent was given."""
+        mock_boto3 = MagicMock()
+        with patch.dict(sys.modules, {"boto3": mock_boto3}):
+            import importlib
+            from tne_sdk.llm import bedrock
+            importlib.reload(bedrock)
+            bedrock.BedrockProvider(model_id="test-model", timeout=45)
+            config = mock_boto3.client.call_args.kwargs["config"]
+            assert config.read_timeout == 45
+            assert config.connect_timeout == 10
+            assert config.retries == {"total_max_attempts": 1}
 
 
 class TestBedrockChatCompletion:
@@ -256,8 +270,21 @@ class TestProviderFromProfileBedrock:
             assert isinstance(p, bedrock.BedrockProvider)
             # Should default to us-east-1
             mock_boto3.client.assert_called_with(
-                "bedrock-runtime", region_name="us-east-1"
+                "bedrock-runtime", region_name="us-east-1", config=ANY,
             )
+
+    def test_timeout_is_applied_and_retries_are_off(self):
+        """A call must never run longer than the timeout the agent was given."""
+        mock_boto3 = MagicMock()
+        with patch.dict(sys.modules, {"boto3": mock_boto3}):
+            import importlib
+            from tne_sdk.llm import bedrock
+            importlib.reload(bedrock)
+            bedrock.BedrockProvider(model_id="test-model", timeout=45)
+            config = mock_boto3.client.call_args.kwargs["config"]
+            assert config.read_timeout == 45
+            assert config.connect_timeout == 10
+            assert config.retries == {"total_max_attempts": 1}
 
     def test_bedrock_url_case_insensitive(self):
         mock_boto3 = MagicMock()

@@ -97,6 +97,44 @@ def _parse_frame(raw: str | bytes) -> dict | None:
     return msg
 
 
+class LatestState:
+    """Holds the newest game state that has not been answered yet.
+
+    A state replaces any older one still waiting, so a slow turn never leaves
+    the agent working through a queue of states that are no longer true.
+    """
+
+    def __init__(self) -> None:
+        self._state: dict | None = None
+        self._changed = asyncio.Event()
+        self._closed = False
+
+    @property
+    def waiting(self) -> bool:
+        return self._state is not None
+
+    def put(self, state: dict) -> dict | None:
+        """Store ``state``. Returns the older state it replaced, if any."""
+        replaced, self._state = self._state, state
+        self._changed.set()
+        return replaced
+
+    def close(self) -> None:
+        """No more states will come. ``take`` hands out what is left, then None."""
+        self._closed = True
+        self._changed.set()
+
+    async def take(self) -> dict | None:
+        """Wait for a state and remove it. None once closed and empty."""
+        while self._state is None:
+            if self._closed:
+                return None
+            self._changed.clear()
+            await self._changed.wait()
+        state, self._state = self._state, None
+        return state
+
+
 class TNEClient:
     """
     Persistent WebSocket client for The Null Epoch.
@@ -140,6 +178,7 @@ class TNEClient:
         self._authenticated = False
         self._last_heard    = 0.0
         self._in_turn       = False
+        self.states_skipped = 0   # states replaced by a newer one before a turn got to them
         self._tick_interval = _DEFAULT_TICK_INTERVAL
 
     async def run(
@@ -150,8 +189,11 @@ class TNEClient:
         """
         Connect and run the agent loop.
 
-        Awaits ``on_tick`` with the full state dict for each ``state`` message.
-        If the callback returns an action dict it is sent back to the server.
+        Awaits ``on_tick`` with the full state dict of a ``state`` message, one
+        turn at a time. If the callback returns an action dict it is sent back
+        to the server. When states arrive faster than turns finish, the next
+        turn gets the newest state and the ones in between are skipped
+        (counted in ``states_skipped``).
         ``on_message``, if given, is called with every other server message
         (``action_queued``, ``error``, ``waiting``, ...) after it is logged.
         Blocks until the server rejects the key (4001), the agent is dormant
@@ -224,9 +266,8 @@ class TNEClient:
         Sleeps until the deadline (last message + limit) rather than polling,
         so a healthy connection wakes it about once every couple of minutes.
 
-        Time inside on_tick (an LLM turn) does not count: frames that arrive
-        meanwhile wait in the socket buffer and are read once the turn ends,
-        and the clock restarts then.
+        Time inside on_tick (an LLM turn) does not count, and the clock
+        restarts when the turn ends.
         """
         loop = asyncio.get_running_loop()
         while True:
@@ -264,101 +305,137 @@ class TNEClient:
 
             self._authenticated = True
             logger.info("Authenticated.")
-            _last_logged_result_tick: int | None = None
-            _last_logged_event_tick: int = 0
+            # Reading and answering run side by side. Reading never waits for a
+            # turn, so if states arrive faster than they are answered, only the
+            # newest is kept and the turn after this one acts on current facts.
+            latest = LatestState()
+            answering = asyncio.create_task(self._answer_states(ws, latest, on_tick))
+            try:
+                async for raw in ws:
+                    self._mark_heard()
+                    msg = _parse_frame(raw)
+                    if msg is None:
+                        continue
+                    msg_type = msg.get("type")
 
-            async for raw in ws:
-                self._mark_heard()
-                msg = _parse_frame(raw)
-                if msg is None:
-                    continue
-                msg_type = msg.get("type")
-
-                if msg_type == "state":
-                    tick_info    = msg.get("tick_info") or {}
-                    current_tick = tick_info.get("current_tick", "?")
-                    interval     = tick_info.get("tick_interval_seconds")
-                    if isinstance(interval, (int, float)) and interval > 0:
-                        self._tick_interval = float(interval)
-                    logger.debug("State tick %s", current_tick)
-
-                    # ── Chronicle: surface recent_events as rich log entries ── #
-                    # The server sends a rolling buffer of up to 50 events.
-                    # We only log events from ticks we haven't seen yet.
-                    self._log_chronicle_events(
-                        msg.get("recent_events", []),
-                        current_tick,
-                        _last_logged_event_tick,
-                    )
-                    if isinstance(current_tick, int):
-                        _last_logged_event_tick = current_tick
-
-                    # Log the outcome of the previous action (chronicle-style)
-                    # Only log once per result to avoid repeating the same line
-                    # when the server echoes last_action_result across ticks.
-                    last_result = msg.get("last_action_result")
-                    result_tick = last_result.get("tick") if last_result else None
-                    if last_result and result_tick != _last_logged_result_tick:
-                        _last_logged_result_tick = result_tick
-                        status = last_result.get("status", "")
-                        icon = {"success": "✓", "partial": "~"}.get(status, "✗")
-                        action_name = last_result.get("action", "?")
-                        summary = last_result.get("summary", "")
-                        details = last_result.get("details")
-                        detail_str = ""
-                        if details:
-                            detail_str = " | " + " ".join(f"{k}={v}" for k, v in details.items())
-                        # Result belongs to the previous tick's action
-                        prev_tick = current_tick - 1 if isinstance(current_tick, int) else "?"
-                        logger.info(
-                            "Result (tick %s): %s %s → %s %s%s",
-                            prev_tick, icon, action_name, status.upper(), summary, detail_str,
-                        )
-                    self._in_turn = True
-                    try:
-                        action = await on_tick(msg)
-                        if action:
-                            action_name = action.get("action", "?")
-                            params = action.get("parameters", {})
-                            params_str = " ".join(
-                                f"{k}={v}" for k, v in params.items()
-                            ) if params else ""
-                            display = f"{action_name} {params_str}".strip()
-                            logger.info(
-                                "Action: %s | %s",
-                                display,
-                                action.get("reasoning", ""),
+                    if msg_type == "state":
+                        tick_info = msg.get("tick_info") or {}
+                        interval  = tick_info.get("tick_interval_seconds")
+                        if isinstance(interval, (int, float)) and interval > 0:
+                            self._tick_interval = float(interval)
+                        logger.debug("State tick %s", tick_info.get("current_tick", "?"))
+                        skipped = latest.put(msg)
+                        if skipped is not None:
+                            self.states_skipped += 1
+                            logger.warning(
+                                "Tick %s was never answered: tick %s arrived first. "
+                                "The agent is taking longer than a tick to decide.",
+                                (skipped.get("tick_info") or {}).get("current_tick", "?"),
+                                tick_info.get("current_tick", "?"),
                             )
-                            await ws.send(json.dumps(action))
-                    except Exception as exc:
-                        logger.exception("on_tick raised: %s", exc)
-                    finally:
-                        self._in_turn = False
-                        self._mark_heard()
+                    elif msg_type == "action_queued":
+                        logger.info(
+                            "Server confirmed: %s queued for tick %d",
+                            msg.get("action"),
+                            msg.get("tick", 0) + 1,
+                        )
+                    elif msg_type == "waiting":
+                        logger.info("Waiting for shard: %s", msg.get("message"))
+                    elif msg_type == "heartbeat":
+                        logger.debug("Heartbeat.")
+                    elif msg_type == "error":
+                        logger.warning("Server error [%s]: %s", msg.get("code"), msg.get("message"))
+                    else:
+                        logger.debug("Unknown message type: %s", msg_type)
 
-                elif msg_type == "action_queued":
-                    logger.info(
-                        "Server confirmed: %s queued for tick %d",
-                        msg.get("action"),
-                        msg.get("tick", 0) + 1,
-                    )
-                elif msg_type == "waiting":
-                    logger.info("Waiting for shard: %s", msg.get("message"))
-                elif msg_type == "heartbeat":
-                    logger.debug("Heartbeat.")
-                elif msg_type == "error":
-                    logger.warning("Server error [%s]: %s", msg.get("code"), msg.get("message"))
-                else:
-                    logger.debug("Unknown message type: %s", msg_type)
-
-                if msg_type != "state" and on_message is not None:
-                    try:
-                        on_message(msg)
-                    except Exception as exc:
-                        logger.exception("on_message raised: %s", exc)
+                    if msg_type != "state" and on_message is not None:
+                        try:
+                            on_message(msg)
+                        except Exception as exc:
+                            logger.exception("on_message raised: %s", exc)
+            except asyncio.CancelledError:
+                answering.cancel()
+                raise
+            finally:
+                # Let the turn in hand finish (and the newest state be seen), as
+                # before: an LLM call cannot be recalled, and starting the next
+                # connection while it runs would put two calls on one endpoint.
+                latest.close()
+                if not answering.cancelled():
+                    await asyncio.gather(answering, return_exceptions=True)
 
         # The server closed cleanly; the async for ends without raising.
         return ws.close_code or _CLOSE_NO_STATUS, ws.close_reason or ""
+
+    async def _answer_states(self, ws, latest: "LatestState", on_tick: OnTickCallback) -> None:
+        """Answer states one at a time, always taking the newest one waiting."""
+        last_logged_result_tick: int | None = None
+        last_logged_event_tick: int = 0
+
+        while (msg := await latest.take()) is not None:
+            current_tick = (msg.get("tick_info") or {}).get("current_tick", "?")
+
+            # ── Chronicle: surface recent_events as rich log entries ── #
+            # The server sends a rolling buffer of up to 50 events.
+            # We only log events from ticks we haven't seen yet.
+            self._log_chronicle_events(
+                msg.get("recent_events", []),
+                current_tick,
+                last_logged_event_tick,
+            )
+            if isinstance(current_tick, int):
+                last_logged_event_tick = current_tick
+
+            # Log the outcome of the previous action (chronicle-style)
+            # Only log once per result to avoid repeating the same line
+            # when the server echoes last_action_result across ticks.
+            last_result = msg.get("last_action_result")
+            result_tick = last_result.get("tick") if last_result else None
+            if last_result and result_tick != last_logged_result_tick:
+                last_logged_result_tick = result_tick
+                status = last_result.get("status", "")
+                icon = {"success": "✓", "partial": "~"}.get(status, "✗")
+                action_name = last_result.get("action", "?")
+                summary = last_result.get("summary", "")
+                details = last_result.get("details")
+                detail_str = ""
+                if details:
+                    detail_str = " | " + " ".join(f"{k}={v}" for k, v in details.items())
+                # Result belongs to the previous tick's action
+                prev_tick = current_tick - 1 if isinstance(current_tick, int) else "?"
+                logger.info(
+                    "Result (tick %s): %s %s → %s %s%s",
+                    prev_tick, icon, action_name, status.upper(), summary, detail_str,
+                )
+
+            self._in_turn = True
+            try:
+                action = await on_tick(msg)
+                if action:
+                    action_name = action.get("action", "?")
+                    params = action.get("parameters", {})
+                    params_str = " ".join(
+                        f"{k}={v}" for k, v in params.items()
+                    ) if params else ""
+                    display = f"{action_name} {params_str}".strip()
+                    logger.info(
+                        "Action: %s | %s",
+                        display,
+                        action.get("reasoning", ""),
+                    )
+                    if latest.waiting:
+                        logger.warning(
+                            "The action for tick %s is late: a newer state has already "
+                            "arrived. Sending it anyway.", current_tick,
+                        )
+                    await ws.send(json.dumps(action))
+            except ConnectionClosed:
+                logger.info("Connection closed before tick %s could be answered.", current_tick)
+            except Exception as exc:
+                logger.exception("on_tick raised: %s", exc)
+            finally:
+                self._in_turn = False
+                self._mark_heard()
 
     # ── Chronicle event logging ──────────────────────────────────────────── #
 
