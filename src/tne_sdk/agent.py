@@ -1702,7 +1702,13 @@ class Agent:
                     params["quest_id"] = {**qid_param, "valid_values": filtered}
             if aname == "move" and (terr_param := params.get("territory", {})):
                 # Rich move display: show all reachable territories with power costs
-                travel_costs = terr_param.get("travel_costs", {})
+                # The server names the per-destination costs
+                # power_cost_per_destination; state.travel_costs holds the same map.
+                travel_costs = (
+                    terr_param.get("power_cost_per_destination")
+                    or state.get("travel_costs")
+                    or {}
+                )
                 valid_terrs = terr_param.get("valid_values", [])
                 current_power = state.get("power", 0)
                 if travel_costs:

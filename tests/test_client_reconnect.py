@@ -205,3 +205,94 @@ def test_time_inside_a_long_turn_does_not_count(fast_watchdog, monkeypatch):
 def test_default_limit_is_three_tick_intervals():
     assert client_mod._WATCHDOG_TICKS == 3
     assert TNEClient(api_key="k")._tick_interval == 60.0
+
+
+# ── Newest state wins ─────────────────────────────────────────────────────── #
+
+from tne_sdk.client import LatestState
+
+
+def test_latest_state_keeps_only_the_newest():
+    async def main():
+        latest = LatestState()
+        assert latest.put({"n": 1}) is None
+        assert latest.put({"n": 2}) == {"n": 1}   # 1 was never taken
+        assert latest.waiting
+        assert await latest.take() == {"n": 2}
+        assert not latest.waiting
+        latest.put({"n": 3})
+        latest.close()
+        assert await latest.take() == {"n": 3}    # what is left is still handed out
+        assert await latest.take() is None
+
+    asyncio.run(main())
+
+
+def test_a_slow_turn_is_followed_by_the_newest_state(monkeypatch):
+    """Three states arrive during one slow turn: the next turn gets the last."""
+    answered = []
+    sent_to_server = []
+    clients = []
+
+    async def burst(ws):
+        await ws.send(_state(1))
+        await asyncio.sleep(0.1)          # tick 1's turn is now running
+        for tick in (2, 3, 4):
+            await ws.send(_state(tick))
+        for _ in range(2):                # one action per turn
+            sent_to_server.append(json.loads(await ws.recv())["parameters"]["tick"])
+        await ws.close(4001)
+
+    async def slow_turn(state):
+        tick = state["tick_info"]["current_tick"]
+        answered.append(tick)
+        await asyncio.sleep(0.3)
+        return {"action": "wait", "parameters": {"tick": tick}}
+
+    real_init = TNEClient.__init__
+
+    def tracking_init(self, *args, **kwargs):
+        real_init(self, *args, **kwargs)
+        clients.append(self)
+
+    monkeypatch.setattr(TNEClient, "__init__", tracking_init)
+    _run([("custom", burst)], on_tick=slow_turn, monkeypatch=monkeypatch)
+
+    assert answered == [1, 4]
+    assert sent_to_server == [1, 4]
+    assert clients[0].states_skipped == 2
+
+
+def test_other_messages_are_read_while_a_turn_is_running(monkeypatch):
+    order = []
+
+    async def chatty(ws):
+        await ws.send(_state(1))
+        await asyncio.sleep(0.1)
+        await ws.send(json.dumps({"type": "heartbeat"}))
+        await ws.recv()
+        await ws.close(4001)
+
+    async def slow_turn(state):
+        await asyncio.sleep(0.3)
+        order.append("turn done")
+        return {"action": "wait", "parameters": {}}
+
+    connections = []
+
+    async def handler(ws):
+        connections.append(1)
+        await ws.recv()
+        await ws.send(json.dumps({"type": "auth_ok"}))
+        await chatty(ws)
+
+    async def main():
+        async with serve(handler, "127.0.0.1", 0) as server:
+            port = next(iter(server.sockets)).getsockname()[1]
+            client = TNEClient(api_key="k", host=f"127.0.0.1:{port}", secure=False, reconnect=False)
+            await asyncio.wait_for(
+                client.run(slow_turn, on_message=lambda m: order.append(m["type"])), timeout=10,
+            )
+
+    asyncio.run(main())
+    assert order == ["heartbeat", "turn done"]

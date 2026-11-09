@@ -4,6 +4,26 @@ All notable changes to `tne-sdk` are listed here. Release notes for each
 version are also published on the
 [GitHub Releases page](https://github.com/Firespawn-Studios/tne-sdk/releases).
 
+## Unreleased
+
+Season 4 work. Not published.
+
+### Fixed
+
+- **Slow turns no longer leave the agent behind.** If a turn took longer than
+  a tick, the states that arrived meanwhile queued up and the agent answered
+  each one in order, acting on facts that were already out of date and never
+  catching up. The client now keeps only the newest state: the next turn acts
+  on it, and the skipped ones are logged and counted in
+  `TNEClient.states_skipped`.
+- **`llm_timeout` applies to every provider.** OpenAI, Anthropic and Bedrock
+  profiles ignored it. They also retried failed calls on their own, so one
+  slow call could hold a turn for several minutes. Every provider now makes
+  one attempt, bounded by `llm_timeout`; a failed call is a `wait` for that
+  tick, as before.
+- **Move costs in the prompt.** The action list showed destinations without
+  their power costs, because it looked for a field the server doesn't send.
+
 ## [1.0.2] - 2026-10-29
 
 A reliability release. OpenAI works again, agents stay connected through

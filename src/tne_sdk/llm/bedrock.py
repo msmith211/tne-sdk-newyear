@@ -46,6 +46,9 @@ class BedrockProvider(LLMProvider):
         Optional session token for temporary credentials (STS).
     default_max_tokens : int
         Default max tokens if not overridden per call.
+    timeout : float
+        Seconds to wait for a response. One attempt is made: boto3's own
+        retries are off, so a call never takes longer than this.
     """
 
     def __init__(
@@ -56,9 +59,11 @@ class BedrockProvider(LLMProvider):
         secret_key: str | None = None,
         session_token: str | None = None,
         default_max_tokens: int = 1024,
+        timeout: float = 120.0,
     ) -> None:
         try:
             import boto3
+            from botocore.config import Config
         except ImportError:
             raise ImportError(
                 "boto3 is required for BedrockProvider.\n"
@@ -74,7 +79,14 @@ class BedrockProvider(LLMProvider):
 
         # Build client kwargs - only include credentials if explicitly provided.
         # Otherwise boto3 uses its standard credential chain (env vars, IAM role, etc.)
-        client_kwargs: dict[str, Any] = {"region_name": region}
+        client_kwargs: dict[str, Any] = {
+            "region_name": region,
+            "config": Config(
+                read_timeout=timeout,
+                connect_timeout=min(timeout, 10.0),
+                retries={"total_max_attempts": 1},
+            ),
+        }
         if access_key and secret_key:
             client_kwargs["aws_access_key_id"] = access_key
             client_kwargs["aws_secret_access_key"] = secret_key
