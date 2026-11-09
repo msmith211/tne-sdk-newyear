@@ -1,6 +1,5 @@
-# Runs the test suite on every supported Python version. Runs on pull
-# requests, and python-publish.yml calls it so nothing reaches PyPI unless
-# every version passes.
+# Runs the test suite on every supported Python version, on pull requests.
+# This fork has no publish workflow: nothing here can reach PyPI.
 
 name: Tests
 
