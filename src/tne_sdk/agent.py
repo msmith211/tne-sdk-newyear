@@ -440,6 +440,8 @@ class Agent:
             logger.debug("Memory mirror skipped: %s", exc)
             return None
         patch = turns.server_memory_patch(tasks, narrative if isinstance(narrative, str) else "")
+        if not patch["plan"] and not patch["goals"]:
+            return None     # nothing to say yet: leave whatever the server holds alone
         if patch == self._last_memory_sent:
             return None
         if patch["plan"] == held.get("plan") and patch["goals"] == (held.get("goals") or []):

@@ -385,6 +385,10 @@ class TestMemoryMirror:
     def test_it_can_be_turned_off(self):
         assert "memory" not in _turn(self._agent(mirror_memory=False), _playable(7, memory=self._SERVER))
 
+    def test_an_empty_local_summary_never_wipes_what_the_server_holds(self):
+        held = {"plan": "Written by hand.", "goals": ["Keep this"], "notes": []}
+        assert "memory" not in _turn(_agent(memory=_Memory()), _playable(7, memory=held))
+
     def test_an_agent_with_no_local_memory_sends_nothing(self):
         assert "memory" not in _turn(_agent(memory=NullMemory()), _playable(7, memory=self._SERVER))
 

@@ -31,6 +31,7 @@ def run_main() -> None:
     parser.add_argument("--agent",        default=None,        help="Agent profile name from agents.json")
     parser.add_argument("--list",         action="store_true", help="List configured agents and exit")
     parser.add_argument("--game-host",    default=None,        help="Override game server host (default: live server)")
+    parser.add_argument("--no-secure",    action="store_true", help="Use ws:// with --game-host (automatic for localhost and private addresses)")
     parser.add_argument("--no-memory",    action="store_true", help="Stateless mode (use NullMemory)")
     parser.add_argument("--log-payloads", action="store_true", help="Write full request/response JSON to logs/")
     parser.add_argument("--verbose",      action="store_true", help="DEBUG-level logging")
@@ -110,7 +111,8 @@ def run_main() -> None:
     # Game host: --game-host override or live server default
     if args.game_host:
         host   = args.game_host
-        secure = not host.startswith("127.")
+        # A server on this machine or the local network is plain ws://.
+        secure = not (args.no_secure or _is_local_host(host))
     else:
         host   = LIVE_GAME_HOST
         secure = True
@@ -239,3 +241,17 @@ def _configure_logging(verbose: bool) -> None:
     if not verbose:
         for noisy in ("httpx", "httpcore", "websockets"):
             logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+def _is_local_host(host: str) -> bool:
+    """Whether ``host`` (optionally ``host:port``) is this machine or a private
+    network address, where a game server runs without TLS."""
+    import ipaddress
+    name = host.rsplit(":", 1)[0].strip("[]").lower() if host.count(":") <= 1 else host.strip("[]").lower()
+    if name in ("localhost", "host.docker.internal") or name.endswith(".local"):
+        return True
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_private
