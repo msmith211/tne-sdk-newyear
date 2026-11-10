@@ -252,6 +252,7 @@ class OpenAICompatibleProvider(LLMProvider):
             headers={"Authorization": f"Bearer {api_key}"},
             timeout=timeout,
         )
+        self.last_usage: dict[str, int] = {}    # token counts of the last call
 
     def chat_completion(
         self,
@@ -283,6 +284,14 @@ class OpenAICompatibleProvider(LLMProvider):
         response.raise_for_status()
         data = response.json()
         msg = data["choices"][0]["message"]
+        usage = data.get("usage") or {}
+        self.last_usage = {
+            ours: int(usage[theirs])
+            for ours, theirs in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"))
+            if isinstance(usage.get(theirs), (int, float))
+        }
+        if msg.get("reasoning_content"):
+            self.last_usage["reasoning_chars"] = len(msg["reasoning_content"])
 
         # Log reasoning_content if the server separates it (--reasoning-format auto).
         # This doesn't affect the return value - just makes it visible in logs.

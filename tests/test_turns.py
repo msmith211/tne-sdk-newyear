@@ -554,3 +554,12 @@ class TestMcp:
         names = [tool["name"] for tool in mcp.TOOLS]
         assert names == ["get_state", "get_catalog", "submit_action"]
         assert "memory" in mcp.TOOLS[2]["inputSchema"]["properties"]
+
+
+def test_timing_line_says_what_made_a_turn_slow():
+    from tne_sdk import turns
+    line = turns.timing_line(112, 31.4, 27.0, {"output_tokens": 628, "input_tokens": 3300, "reasoning_chars": 1800})
+    assert "31.4s" in line and "of 27s available (LATE)" in line
+    assert "628 tokens out at 20/s" in line and "3300 tokens in" in line and "1800 characters of hidden reasoning" in line
+    assert turns.timing_line(5, 4.0, None, None) == "Tick 5: the model answered in 4.0s."
+    assert "(LATE)" not in turns.timing_line(5, 4.0, 27.0, {})

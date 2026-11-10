@@ -147,3 +147,24 @@ def server_memory_patch(tasks: Sequence[Mapping[str, Any]], narrative: str = "")
     if narrative:
         plan = _short(f"{plan} | {narrative}" if plan else narrative, PLAN_CHARS)
     return {"plan": plan or None, "goals": goals[:GOALS_KEPT]}
+
+
+def timing_line(tick: Any, seconds: float, budget: float | None, usage: Mapping[str, Any] | None) -> str:
+    """One line on how long the model took for a turn, against the time it had.
+
+    A model that keeps missing the deadline is slow for one of a few reasons,
+    and this is what tells them apart: a long answer (many output tokens), a
+    slow model (few tokens a second), hidden reasoning, or a late start.
+    """
+    usage = usage or {}
+    parts = [f"Tick {tick}: the model answered in {seconds:.1f}s"]
+    if budget is not None:
+        parts.append(f"of {budget:.0f}s available" + ("" if seconds <= budget else " (LATE)"))
+    out = usage.get("output_tokens")
+    if isinstance(out, (int, float)) and out > 0 and seconds > 0:
+        parts.append(f"{int(out)} tokens out at {out / seconds:.0f}/s")
+    if isinstance(usage.get("input_tokens"), (int, float)):
+        parts.append(f"{int(usage['input_tokens'])} tokens in")
+    if usage.get("reasoning_chars"):
+        parts.append(f"{int(usage['reasoning_chars'])} characters of hidden reasoning")
+    return ", ".join(parts) + "."

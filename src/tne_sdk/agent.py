@@ -609,14 +609,21 @@ class Agent:
         otherwise never act at all. Its answer is returned when it comes and
         is sent late; the server runs it or turns it away as stale.
         """
+        started = time.monotonic()
         call = asyncio.ensure_future(self._get_llm_action(user_prompt, tick))
         send = getattr(self.client, "send", None)
-        if not self.config.deadline_fallback or send is None:
-            return await call
         waited = 0.0
         if hasattr(self.client, "seconds_since_received"):
             waited = self.client.seconds_since_received(state)
         budget = turns.DecisionBudget.from_state(state, waited, self.config.deadline_margin_seconds)
+
+        def report(_: Any) -> None:
+            logger.info(turns.timing_line(
+                tick, time.monotonic() - started, budget.seconds, getattr(self.llm, "last_usage", None)))
+        call.add_done_callback(report)
+
+        if not self.config.deadline_fallback or send is None:
+            return await call
         if budget.seconds is None:
             return await call               # the server gave no deadline to work to
         done, _ = await asyncio.wait({call}, timeout=budget.seconds)
