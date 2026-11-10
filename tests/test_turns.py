@@ -307,7 +307,10 @@ class TestAgentTurns:
         assert fallback["action"] == "defend" and fallback["reasoning"].startswith("[fallback_rule]")
         assert fallback["based_on_tick"] == 7 and "decision_source" not in fallback
         assert action["action"] == "flee" and action["based_on_tick"] == 7       # the model's own, sent late
-        assert action["action_id"] != fallback["action_id"] and agent.fallbacks_sent == 1
+        # One turn, one id: the server treats the model's answer as the same action updated.
+        assert action["action_id"] == fallback["action_id"] and agent.fallbacks_sent == 1
+        later = _turn(agent, _playable(8))
+        assert later["action_id"] != fallback["action_id"]
 
     def test_no_deadline_from_the_server_means_no_fallback(self):
         client = _Client()

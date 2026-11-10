@@ -327,6 +327,7 @@ class Agent:
         self._catalog: dict | None = None            # the game catalogue, read once per run
         self._review_due: str | None = None          # "reflection" or "tactical", run after the turn
         self._last_memory_sent: dict | None = None   # the last plan/goals mirrored to the server
+        self._fallback_action_id: str | None = None  # id of a fallback sent this turn, if any
         self.fallbacks_sent = 0                      # safe rules sent because the model was not in time
         self.auto_waits = 0                          # turns answered without calling the model
 
@@ -417,6 +418,11 @@ class Agent:
         """An action as it goes on the wire."""
         self._action_serial += 1
         out = turns.stamp(action, state, self._session_id, self._action_serial)
+        if self._fallback_action_id:
+            # This turn already sent a fallback. The model's answer takes its
+            # id, so the server sees one action updated, not a second action
+            # replacing the first.
+            out["action_id"], self._fallback_action_id = self._fallback_action_id, None
         patch = self._memory_mirror(state)
         if patch is not None:
             out["memory"] = patch
@@ -618,7 +624,9 @@ class Agent:
             return call.result()
         fallback = turns.fallback_action(state)
         self._action_serial += 1
-        if await send(turns.stamp(fallback, state, self._session_id, self._action_serial)):
+        stamped = turns.stamp(fallback, state, self._session_id, self._action_serial)
+        if await send(stamped):
+            self._fallback_action_id = stamped["action_id"]
             self.fallbacks_sent += 1
             logger.warning(
                 "Tick %s: the model had not answered %.0fs before the deadline. Sent '%s' as a "
