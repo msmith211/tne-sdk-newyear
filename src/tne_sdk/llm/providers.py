@@ -141,6 +141,22 @@ class OpenAIProvider(LLMProvider):
         return response.choices[0].message.content or ""
 
 
+def _usage_of(response: Any) -> dict[str, int]:
+    """Token counts from a response, cache reads and writes included. {} if there are none."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {}
+    counts = {}
+    for name in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+        value = getattr(usage, name, None)
+        if isinstance(value, int):
+            counts[name] = value
+    if counts.get("cache_read_input_tokens") or counts.get("cache_creation_input_tokens"):
+        logger.debug("Prompt cache: %s tokens read, %s written.",
+                     counts.get("cache_read_input_tokens", 0), counts.get("cache_creation_input_tokens", 0))
+    return counts
+
+
 class AnthropicProvider(LLMProvider):
     """LLM Provider for the Anthropic Claude API."""
 
@@ -159,6 +175,7 @@ class AnthropicProvider(LLMProvider):
             api_key=self.api_key, timeout=timeout, max_retries=_MAX_RETRIES,
         )
         self.default_model = default_model
+        self.last_usage: dict[str, int] = {}    # token counts of the last call
 
     def chat_completion(
         self,
@@ -173,6 +190,7 @@ class AnthropicProvider(LLMProvider):
         model_to_use = model or self.default_model
 
         # Anthropic uses a top-level system param; strip unsupported kwargs
+        cache_system = kwargs.pop("cache_system", True)
         system_prompt = ""
         filtered: list[dict[str, str]] = []
         for m in messages:
@@ -186,14 +204,23 @@ class AnthropicProvider(LLMProvider):
                             "top_k", "frequency_penalty"):
             kwargs.pop(unsupported, None)
 
+        # The system prompt is the same on every turn, so it is marked as a
+        # cache point: after the first call it is read back at a fraction of
+        # the input price while calls come less than five minutes apart. A
+        # prompt shorter than the model's minimum is simply not cached.
+        system: Any = system_prompt
+        if cache_system and system_prompt:
+            system = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
+
         response = self._client.messages.create(
             model=model_to_use,
-            system=system_prompt,
+            system=system,
             messages=filtered,
             max_tokens=max_tokens,
             temperature=temperature,
             **kwargs,
         )
+        self.last_usage = _usage_of(response)
         return response.content[0].text
 
 

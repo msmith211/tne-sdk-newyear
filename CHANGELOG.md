@@ -39,6 +39,16 @@ Season 4 work. Not published.
   `get_catalog` tool returns the briefing and action rules. `submit_action`
   takes an optional `memory` object and marks each action with the tick of
   the state last read.
+- **Prompt caching for Anthropic and Bedrock.** The system prompt is the same
+  on every turn, so it is now sent as a cache point. After the first call it
+  is read back at a fraction of the input price while calls come less than
+  five minutes apart. Anthropic: on by default (`cache_system=False` on a call
+  turns it off). Bedrock: sent for Claude and Nova models; a model that
+  refuses the cache point is remembered and called without it. A prompt
+  shorter than the model's minimum cacheable length is not cached; nothing
+  fails. Token counts, including cache reads and writes, are on
+  `provider.last_usage`. OpenAI caches a repeated prefix by itself and needs
+  no change.
 - `TNEClient.run` takes `after_turn`, called once the turn's action is sent,
   and `TNEClient.send` sends an action from inside a turn.
 

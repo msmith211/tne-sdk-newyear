@@ -27,6 +27,11 @@ from .providers import LLMProvider, Message
 logger = logging.getLogger(__name__)
 
 
+# Model families that accept a prompt cache point in the Converse API. A model
+# from one of these that still refuses is remembered and not asked again.
+_CACHING_MODEL_FAMILIES = ("anthropic.claude", "amazon.nova")
+
+
 class BedrockProvider(LLMProvider):
     """
     LLM Provider for AWS Bedrock via the Converse API.
@@ -94,6 +99,15 @@ class BedrockProvider(LLMProvider):
                 client_kwargs["aws_session_token"] = session_token
 
         self._client = boto3.client("bedrock-runtime", **client_kwargs)
+        self._no_cache_point: set[str] = set()   # models that refused a prompt cache point
+        self.last_usage: dict[str, int] = {}     # token counts of the last call
+
+    def _caches_prompts(self, model_id: str) -> bool:
+        """Whether to send a cache point for this model: the model families
+        that cache prompts on Bedrock, unless this one has already refused."""
+        name = model_id.lower()
+        return model_id not in self._no_cache_point and any(
+            family in name for family in _CACHING_MODEL_FAMILIES)
 
     def chat_completion(
         self,
@@ -141,6 +155,12 @@ class BedrockProvider(LLMProvider):
         }
         if system_blocks:
             converse_kwargs["system"] = system_blocks
+        # The system prompt is the same on every turn. On models that cache
+        # prompts, a cache point after it means later calls read it back at a
+        # fraction of the input price.
+        cached = bool(system_blocks) and self._caches_prompts(model_to_use)
+        if cached:
+            converse_kwargs["system"] = [*system_blocks, {"cachePoint": {"type": "default"}}]
 
         # Strip SDK-specific kwargs that Converse doesn't understand
         # (these may be passed through from AgentConfig)
@@ -149,7 +169,21 @@ class BedrockProvider(LLMProvider):
         kwargs.pop("top_k", None)
         kwargs.pop("frequency_penalty", None)
 
-        response = self._client.converse(**converse_kwargs)
+        try:
+            response = self._client.converse(**converse_kwargs)
+        except Exception as exc:
+            if not cached or "cache" not in str(exc).lower():
+                raise
+            # This model or region turned the cache point away. Do without it
+            # from now on; the call itself is made again, unchanged otherwise.
+            logger.info("Bedrock refused a prompt cache point for %s; continuing without one.", model_to_use)
+            self._no_cache_point.add(model_to_use)
+            converse_kwargs["system"] = system_blocks
+            response = self._client.converse(**converse_kwargs)
+        usage = response.get("usage") or {}
+        self.last_usage = {name: usage[name] for name in (
+            "inputTokens", "outputTokens", "cacheReadInputTokens", "cacheWriteInputTokens",
+        ) if isinstance(usage.get(name), int)}
 
         # Extract text from response content blocks
         content_blocks = response["output"]["message"]["content"]
