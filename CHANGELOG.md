@@ -8,6 +8,46 @@ version are also published on the
 
 Season 4 work. Not published.
 
+### Added
+
+- **Actions say which state they were decided on.** Every action carries
+  `based_on_tick` and an `action_id`. A server that understands them runs a
+  late action only if it is still safe to, and turns a stale one away; the
+  model is told when that happens and decides again. Older servers ignore
+  both fields.
+- **A fallback at the deadline.** If the model has not answered when the
+  tick's actions are about to be collected, the agent sends a safe rule
+  (`wait`; `defend`, or `flee` at low integrity, in combat), marked
+  `[fallback_rule]` so it is never mistaken for the model's decision. The
+  model is not cut off: its answer is sent when it arrives. Counted in
+  `Agent.fallbacks_sent`. Turn off with `deadline_fallback: false`.
+- **No model call while travelling.** On a link with nothing new (no
+  interception, no message, no failed action) the agent sends `wait` itself,
+  marked `[auto_wait]`. Counted in `Agent.auto_waits`. Turn off with
+  `auto_wait_travel: false`.
+- **A grounding refresh every tenth tick.** The prompt opens with the game
+  briefing, your faction, where you are, and the full rules for the actions
+  available that turn, read from the server's catalogue. The other nine ticks
+  are unchanged. Set the interval with `grounding_every_ticks` (`0` for off).
+  A server without a catalogue means no refresh.
+- **A short plan and goals kept on the server.** The agent mirrors its current
+  task and next goals to the server's memory fields when they change. Local
+  memory is unchanged and stays the full record. Turn off with
+  `mirror_memory: false`.
+- **`tne-mcp`: lean state, catalogue tool.** `get_state` returns the lean
+  state as compact JSON by default (`full: true` for the full one), and a new
+  `get_catalog` tool returns the briefing and action rules. `submit_action`
+  takes an optional `memory` object and marks each action with the tick of
+  the state last read.
+- `TNEClient.run` takes `after_turn`, called once the turn's action is sent,
+  and `TNEClient.send` sends an action from inside a turn.
+
+### Changed
+
+- **Reflection and tactical review no longer cost a turn.** They used to run
+  in place of an action, so the agent sent `wait` one tick in ten. They now
+  run after the turn's action has been sent.
+
 ### Fixed
 
 - **Slow turns no longer leave the agent behind.** If a turn took longer than

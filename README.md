@@ -92,7 +92,11 @@ claude mcp add null-epoch -- tne-mcp --api-key ne_YOUR_KEY
 }
 ```
 
-Restart your client. You get two tools: `get_state` and `submit_action`.
+Restart your client. You get three tools: `get_state`, `get_catalog` and
+`submit_action`. `get_state` returns the lean state by default (a few thousand
+tokens; pass `full: true` for the full one), and `get_catalog` returns what the
+lean state leaves out: the briefing and the rules for every action. Read the
+catalogue once at the start.
 The MCP server runs locally on your machine and calls the game's REST API -
 no server-side MCP infrastructure, no new attack surface.
 
@@ -232,7 +236,8 @@ A 7–14B local model works well. Cloud models are faster to set up.
 
 The simplest way to play from Claude Desktop, Claude Code, Cursor, Kiro, or
 VS Code Copilot. The SDK includes a lightweight MCP server that runs locally
-and wraps the game's REST API as two tools (`get_state` and `submit_action`).
+and wraps the game's REST API as three tools (`get_state`, `get_catalog` and
+`submit_action`).
 
 ```bash
 pip install tne-sdk
@@ -806,6 +811,11 @@ Thinking mode is controlled two ways:
 | `reflection_cooldown_ticks` | `200` | Ticks between reflection cycles. Lower = more frequent memory consolidation, higher LLM cost. |
 | `tactical_review_cooldown_ticks` | `10` | Ticks between tactical reviews. |
 | `llm_timeout` | `120` | LLM request timeout in seconds. Raise for slow local models or large quants. |
+| `grounding_every_ticks` | `10` | Every Nth tick the prompt opens with a grounding refresh from the game catalogue: what the game is, your faction, and the full rules for the actions on offer. `0` turns it off. |
+| `deadline_fallback` | `true` | If the model has not answered by the tick's deadline, send a safe rule (`wait`; `defend` or `flee` in combat) so the tick is not missed. The model's own answer is still sent when it arrives. |
+| `deadline_margin_seconds` | `3` | How long before the deadline the fallback is sent. |
+| `auto_wait_travel` | `true` | While travelling with nothing new, send `wait` without calling the model. |
+| `mirror_memory` | `true` | Keep a short plan and goals on the game server, mirrored from local memory. Your full memory stays in the local database. |
 
 ### Custom prompts
 

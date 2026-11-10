@@ -121,19 +121,59 @@ CAPABILITIES = {
     "tools": {},
 }
 
+# Parts of the catalogue a client can ask for by name. With no section it gets
+# the essentials: enough to play from the lean state.
+_CATALOG_SECTIONS = ("items", "recipes", "factions", "territories", "network")
+_CATALOG_ESSENTIALS = ("catalog_version", "game", "actions", "rules", "state_guide")
+
+
+def _compact(value: Any) -> str:
+    """JSON without the whitespace: a model pays for every character."""
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+
+
 TOOLS = [
     {
         "name": "get_state",
         "description": (
-            "Get your agent's full game state for the current tick. "
-            "Returns everything: integrity, power, inventory, nearby agents/NPCs, "
-            "available actions with parameter schemas, combat state, quests, "
-            "shop inventory, auction house, territory info, and AI-generated "
-            "narrative context. Call this every tick before deciding your action."
+            "Get your agent's game state for the current tick. Call this every tick "
+            "before deciding your action. By default you get the lean state: who and "
+            "where you are, your stats and inventory, who and what is nearby, routes "
+            "with their costs, the actions available now, and what has happened since "
+            "your last action. It leaves out text that never changes (what each action "
+            "does, item and recipe details, lore): read that once with get_catalog. "
+            "Pass full=true for the full state, which explains every action in place "
+            "and lists everything; it is many times larger, so use it sparingly."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "full": {
+                    "type": "boolean",
+                    "description": "true for the full, self-explaining state. Default false (lean).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_catalog",
+        "description": (
+            "Read the game catalogue: everything that does not change from tick to "
+            "tick. Call it once at the start, and again if catalog_version in your "
+            "state changes. With no section you get the briefing, the rules for every "
+            "action, and a guide to the fields of the lean state. Other sections on "
+            "request: items, recipes, factions, territories, network (the map)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "section": {
+                    "type": "string",
+                    "enum": list(_CATALOG_SECTIONS),
+                    "description": "One part of the catalogue. Leave out for the essentials.",
+                },
+            },
             "required": [],
         },
     },
@@ -142,10 +182,13 @@ TOOLS = [
         "description": (
             "Submit an action for the current tick. The action is queued and "
             "resolved when the tick ends (~60 second ticks). Results appear in "
-            "last_action_result on your next get_state call. Always check "
-            "available_actions in your state before submitting - valid actions "
-            "and parameters change every tick based on location, inventory, "
-            "and combat state."
+            "your next get_state call (new.result in the lean state, "
+            "last_action_result in the full one). Always check the actions in your "
+            "state before submitting - valid actions and parameters change every "
+            "tick based on location, inventory, and combat state. The action is "
+            "marked with the tick of the state you last read: if the world has "
+            "moved on too far since then it is refused as stale, and you should "
+            "call get_state and decide again."
         ),
         "inputSchema": {
             "type": "object",
@@ -174,6 +217,14 @@ TOOLS = [
                     "description": (
                         "Free-text reasoning explaining your decision. Stored in "
                         "event history and visible to spectators. Always include this."
+                    ),
+                },
+                "memory": {
+                    "type": "object",
+                    "description": (
+                        "Optional. Notes the server keeps for you and shows back in every "
+                        "state: plan (one string), goals (up to 5 strings), notes (up to 8). "
+                        "A field you send replaces the stored one; null clears it."
                     ),
                 },
             },
@@ -231,25 +282,54 @@ class _GameAPI:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+        self.last_tick: int | None = None      # the tick of the state last read
+        self._catalog: dict | None = None
 
-    def get_state(self) -> dict:
+    def get_state(self, full: bool = False) -> dict:
+        """The agent's state: lean by default, the full one on request.
+
+        A server that has no lean state ignores the request and sends the full
+        one. Either way the tick is remembered, for submit_action.
+        """
         import httpx
         resp = httpx.get(
             f"{self.base_url}/v1/agent/state",
             headers=self.headers,
+            params=None if full else {"format": 2},
             timeout=15.0,
         )
         _check_response(resp)
-        return resp.json()
+        state = resp.json()
+        if isinstance(state, dict):
+            tick = (state.get("tick_info") or {}).get("current_tick", state.get("tick"))
+            self.last_tick = tick if isinstance(tick, int) else None
+        return state
+
+    def get_catalog(self, section: str | None = None) -> dict:
+        """The game catalogue, or one part of it. Read once and kept."""
+        import httpx
+        if self._catalog is None:
+            resp = httpx.get(f"{self.base_url}/v1/agent/catalog", headers=self.headers, timeout=15.0)
+            _check_response(resp)
+            self._catalog = resp.json()
+        catalog = self._catalog
+        if section:
+            return {"catalog_version": catalog.get("catalog_version"), section: catalog.get(section)}
+        return {key: catalog[key] for key in _CATALOG_ESSENTIALS if key in catalog}
 
     def submit_action(self, action: str, parameters: dict | None = None,
-                      reasoning: str | None = None) -> dict:
+                      reasoning: str | None = None, memory: dict | None = None) -> dict:
         import httpx
         body: dict[str, Any] = {"action": action}
         if parameters:
             body["parameters"] = parameters
         if reasoning:
             body["reasoning"] = reasoning
+        if isinstance(memory, dict):
+            body["memory"] = memory
+        if self.last_tick is not None:
+            # The state this action was decided on, so the server can tell if it is late.
+            body["based_on_tick"] = self.last_tick
         resp = httpx.post(
             f"{self.base_url}/v1/agent/action",
             headers=self.headers,
@@ -288,13 +368,28 @@ def _handle_request(method: str, params: dict | None, id: Any, api: _GameAPI) ->
 
         if tool_name == "get_state":
             try:
-                state = api.get_state()
+                state = api.get_state(full=bool(arguments.get("full")))
                 _result(id, {
-                    "content": [{"type": "text", "text": json.dumps(state, indent=2)}],
+                    "content": [{"type": "text", "text": _compact(state)}],
                 })
             except Exception as e:
                 _result(id, {
                     "content": [{"type": "text", "text": f"Error fetching state: {e}"}],
+                    "isError": True,
+                })
+            return
+
+        if tool_name == "get_catalog":
+            try:
+                section = arguments.get("section")
+                if section is not None and section not in _CATALOG_SECTIONS:
+                    raise ValueError(f"unknown section {section!r}; use one of {', '.join(_CATALOG_SECTIONS)}")
+                _result(id, {
+                    "content": [{"type": "text", "text": _compact(api.get_catalog(section))}],
+                })
+            except Exception as e:
+                _result(id, {
+                    "content": [{"type": "text", "text": f"Error fetching catalogue: {e}"}],
                     "isError": True,
                 })
             return
@@ -305,9 +400,10 @@ def _handle_request(method: str, params: dict | None, id: Any, api: _GameAPI) ->
                     action=arguments.get("action", "wait"),
                     parameters=arguments.get("parameters"),
                     reasoning=arguments.get("reasoning"),
+                    memory=arguments.get("memory"),
                 )
                 _result(id, {
-                    "content": [{"type": "text", "text": json.dumps(resp, indent=2)}],
+                    "content": [{"type": "text", "text": _compact(resp)}],
                 })
             except Exception as e:
                 _result(id, {

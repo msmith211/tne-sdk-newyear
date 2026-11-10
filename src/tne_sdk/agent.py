@@ -5,7 +5,11 @@ Orchestrates the full cognitive loop:
   - WebSocket connection via TNEClient
   - Long-term memory via MemoryProvider
   - LLM decision-making via LLMProvider
-  - Reflection and tactical review cycles
+  - Reflection and tactical review cycles, run after the turn's action is sent
+  - Deadline handling: a safe rule at the deadline, the model's answer when it comes
+  - No model call on turns with nothing to decide (travelling)
+  - A grounding refresh from the game catalogue every few ticks
+  - A short plan and goals mirrored to the game server
   - TickSummary callbacks for external consumers (TUI, scripts)
   - Hot-inject directives from a watched text file
   - Optional full request/response payload logging
@@ -22,6 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from . import turns
+from .catalog import fetch_catalog, grounding_block, is_grounding_tick
 from .client import TNEClient
 from .config import AgentConfig
 from .llm.providers import LLMProvider, Message
@@ -315,6 +321,15 @@ class Agent:
         # _repair_json strips it. Used for research divergence analysis.
         self._last_think_trace: str | None = None
 
+        # Turn handling (see turns.py and catalog.py)
+        self._session_id = turns.new_session_id()   # prefix of every action_id this run
+        self._action_serial = 0
+        self._catalog: dict | None = None            # the game catalogue, read once per run
+        self._review_due: str | None = None          # "reflection" or "tactical", run after the turn
+        self._last_memory_sent: dict | None = None   # the last plan/goals mirrored to the server
+        self.fallbacks_sent = 0                      # safe rules sent because the model was not in time
+        self.auto_waits = 0                          # turns answered without calling the model
+
     # ── Public API ────────────────────────────────────────────────────────── #
 
     async def run(self) -> None:
@@ -332,8 +347,12 @@ class Agent:
                 self.config.max_tokens_tactical,    self._effective_max_tokens(self.config.max_tokens_tactical),
             )
         self.memory.open()
+        await self._load_catalog()
         try:
-            await self.client.run(self._on_tick)
+            if self._client_takes("after_turn"):
+                await self.client.run(self._on_tick, after_turn=self._after_turn)
+            else:
+                await self.client.run(self._on_tick)
         except asyncio.CancelledError:
             logger.info("Agent '%s' cancelled - shutting down gracefully.", self.name)
             raise
@@ -341,6 +360,28 @@ class Agent:
             self.memory.close()
             self._is_running = False
             logger.info("Agent '%s' stopped.", self.name)
+
+    def _client_takes(self, parameter: str) -> bool:
+        """Whether this client's run() accepts ``parameter`` (not every client does)."""
+        import inspect
+        try:
+            return parameter in inspect.signature(self.client.run).parameters
+        except (TypeError, ValueError):
+            return False
+
+    async def _load_catalog(self) -> None:
+        """Read the game catalogue for the grounding refresh. Without one, no refresh."""
+        if self.config.grounding_every_ticks <= 0:
+            return
+        host, key = getattr(self.client, "host", None), getattr(self.client, "api_key", None)
+        if not isinstance(host, str) or not isinstance(key, str):
+            return
+        catalog, _etag = await asyncio.to_thread(
+            fetch_catalog, host, key, bool(getattr(self.client, "secure", True)))
+        if catalog:
+            self._catalog = catalog
+            logger.info("Game catalogue %s loaded; grounding refresh every %d ticks.",
+                        catalog.get("catalog_version", "?"), self.config.grounding_every_ticks)
 
     def add_directive(self, text: str) -> None:
         """Inject a directive into memory immediately (thread-safe from TUI)."""
@@ -358,7 +399,64 @@ class Agent:
     # ── Internal lifecycle ────────────────────────────────────────────────── #
 
     async def _on_tick(self, state: dict) -> dict[str, Any] | None:
-        """Main callback: called once per game-state push by TNEClient."""
+        """Main callback: called once per game-state push by TNEClient.
+
+        Decides, then marks the action with the tick it was decided on and an
+        id, and adds the memory mirror when the plan or goals have changed.
+        """
+        action = await self._decide(state)
+        if not action:
+            return action
+        if state and not self._client_takes("after_turn"):
+            # This client cannot call back after sending, so the review runs
+            # here. The action waits for it, but is no longer replaced by a wait.
+            await self._after_turn(state)
+        return self._outgoing(action, state or {})
+
+    def _outgoing(self, action: dict[str, Any], state: dict) -> dict[str, Any]:
+        """An action as it goes on the wire."""
+        self._action_serial += 1
+        out = turns.stamp(action, state, self._session_id, self._action_serial)
+        patch = self._memory_mirror(state)
+        if patch is not None:
+            out["memory"] = patch
+        return out
+
+    def _memory_mirror(self, state: dict) -> dict[str, Any] | None:
+        """The plan and goals to send to the server this turn, or None.
+
+        Sent only to a server that keeps memory (its state carries ``memory``),
+        and only when what the server holds differs from the local summary and
+        this summary has not just been sent.
+        """
+        held = state.get("memory")
+        if not self.config.mirror_memory or not isinstance(held, dict):
+            return None
+        try:
+            with self.memory:
+                tasks = self.memory.get_active_tasks(limit=turns.GOALS_KEPT)
+                narrative = self.memory.get_knowledge("summary:narrative") or ""
+        except Exception as exc:
+            logger.debug("Memory mirror skipped: %s", exc)
+            return None
+        patch = turns.server_memory_patch(tasks, narrative if isinstance(narrative, str) else "")
+        if patch == self._last_memory_sent:
+            return None
+        if patch["plan"] == held.get("plan") and patch["goals"] == (held.get("goals") or []):
+            return None
+        self._last_memory_sent = patch
+        return patch
+
+    async def _after_turn(self, state: dict) -> None:
+        """Run the memory review that fell due this turn, now that the action is sent."""
+        due, self._review_due = self._review_due, None
+        if due == "reflection":
+            await self._run_reflection(turns.tick_of(state) or 0)
+        elif due == "tactical":
+            await self._run_tactical_review(state)
+
+    async def _decide(self, state: dict) -> dict[str, Any] | None:
+        """Choose this turn's action."""
         if not state:
             logger.warning("Empty state received, waiting.")
             return {"action": "wait", "reasoning": "Null state received."}
@@ -400,23 +498,36 @@ class Agent:
             last_refl     = self.memory.get_knowledge("last_reflection_tick")     or 0
             last_tactical = self.memory.get_knowledge("last_tactical_review_tick") or 0
 
-        # Cognitive cycles run sequentially - most LLM endpoints serve one
-        # request at a time, so parallel requests just cause timeouts.
+        # Memory reviews no longer take the turn. One that falls due is noted
+        # here and runs after this turn's action has been sent (_after_turn).
+        # They stay sequential with the action call: most LLM endpoints serve
+        # one request at a time, so parallel requests just cause timeouts.
         if tick > last_refl + self.config.reflection_cooldown_ticks and not in_combat:
-            await self._run_reflection(tick)
-            return {"action": "wait", "reasoning": "Consolidating episodic memory. Standing by."}
+            self._review_due = "reflection"
+        elif tick > last_tactical + self.config.tactical_review_cooldown_ticks and not in_combat:
+            self._review_due = "tactical"
 
-        if tick > last_tactical + self.config.tactical_review_cooldown_ticks and not in_combat:
-            await self._run_tactical_review(state)
-            return {"action": "wait", "reasoning": "Performing tactical review. Standing by."}
+        t0 = time.monotonic()
+
+        # Nothing to decide: on a link with nothing new, wait without asking the model.
+        if self.config.auto_wait_travel and (reason := turns.auto_wait_reason(state)):
+            with self.memory:
+                self.memory.update(state)
+            action = turns.auto_wait(reason)
+            self.auto_waits += 1
+            self._review_due = None      # a review can wait until there is something to review
+            self._remember_action(tick, action)
+            self._emit_summary(state, action, (time.monotonic() - t0) * 1000)
+            return action
 
         # Standard action turn
-        t0 = time.monotonic()
         with self.memory:
             self.memory.update(state)
             user_prompt = self._build_action_prompt(state)
+        if is_grounding_tick(tick, self.config.grounding_every_ticks):
+            user_prompt = grounding_block(self._catalog, state) + user_prompt
 
-        action = await self._get_llm_action(user_prompt, tick)
+        action = await self._llm_action_by_deadline(user_prompt, tick, state)
         elapsed_ms = (time.monotonic() - t0) * 1000
 
         # Handle meta-action: reset_goals
@@ -463,8 +574,16 @@ class Agent:
                 "tick": tick,
             }
 
-        # Record this action in the history ring buffer for prompt rendering
-        # and repetition detection on subsequent ticks.
+        self._remember_action(tick, action)
+
+        # Emit tick summary for TUI / external consumers
+        self._emit_summary(state, action, elapsed_ms)
+
+        return action
+
+    def _remember_action(self, tick: Any, action: dict[str, Any]) -> None:
+        """Record an action in the history ring buffer, for prompt rendering
+        and repetition detection on later ticks."""
         self._action_history.append({
             "tick": tick,
             "action": action.get("action", "wait"),
@@ -473,10 +592,37 @@ class Agent:
         if len(self._action_history) > self._MAX_ACTION_HISTORY:
             self._action_history = self._action_history[-self._MAX_ACTION_HISTORY:]
 
-        # Emit tick summary for TUI / external consumers
-        self._emit_summary(state, action, elapsed_ms)
+    async def _llm_action_by_deadline(self, user_prompt: str, tick: Any, state: dict) -> dict[str, Any]:
+        """Ask the model; if the tick's deadline comes first, send a safe rule and keep waiting.
 
-        return action
+        The rule (wait; defend or flee in combat) goes out at the deadline so
+        the tick is not missed, marked as a fallback so it is never taken for
+        the model's decision. The model is not cut off: a slow model would
+        otherwise never act at all. Its answer is returned when it comes and
+        is sent late; the server runs it or turns it away as stale.
+        """
+        call = asyncio.ensure_future(self._get_llm_action(user_prompt, tick))
+        send = getattr(self.client, "send", None)
+        if not self.config.deadline_fallback or send is None:
+            return await call
+        waited = 0.0
+        if hasattr(self.client, "seconds_since_received"):
+            waited = self.client.seconds_since_received(state)
+        budget = turns.DecisionBudget.from_state(state, waited, self.config.deadline_margin_seconds)
+        if budget.seconds is None:
+            return await call               # the server gave no deadline to work to
+        done, _ = await asyncio.wait({call}, timeout=budget.seconds)
+        if done:
+            return call.result()
+        fallback = turns.fallback_action(state)
+        self._action_serial += 1
+        if await send(turns.stamp(fallback, state, self._session_id, self._action_serial)):
+            self.fallbacks_sent += 1
+            logger.warning(
+                "Tick %s: the model had not answered %.0fs before the deadline. Sent '%s' as a "
+                "fallback; the model's own answer will be sent when it arrives.",
+                tick, self.config.deadline_margin_seconds, fallback["action"])
+        return await call
 
     # ── Hotload directives ────────────────────────────────────────────────── #
 

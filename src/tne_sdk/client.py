@@ -24,6 +24,7 @@ except ImportError as _exc:
     ) from _exc
 
 OnTickCallback = Callable[[dict], Awaitable[dict | None]]
+AfterTurnCallback = Callable[[dict], Awaitable[None]]
 OnMessageCallback = Callable[[dict], None]  # every non-state server message
 OnErrorCallback = Callable[[str, str], None]  # (code, message)
 
@@ -46,6 +47,9 @@ _CLOSE_NO_STATUS = 1006
 _WATCHDOG_TICKS         = 3
 _DEFAULT_TICK_INTERVAL  = 60.0  # used until the first state reports the real one
 _CLOSE_WATCHDOG         = 4000  # sent by this client, never by the server
+
+# Set on each state as it arrives: the loop time, for seconds_since_received().
+_RECEIVED_AT = "_received_at"
 
 # ── Chronicle event types worth surfacing in the TUI ─────────────────────── #
 # These map backend event types to log prefixes that the log_view classifier
@@ -180,11 +184,37 @@ class TNEClient:
         self._in_turn       = False
         self.states_skipped = 0   # states replaced by a newer one before a turn got to them
         self._tick_interval = _DEFAULT_TICK_INTERVAL
+        self._ws = None           # the live connection, for send() during a turn
+        self._after_turn: AfterTurnCallback | None = None
+
+    async def send(self, action: dict) -> bool:
+        """Send an action now, from inside a turn. False if there is no connection.
+
+        A turn normally sends one action, the one ``on_tick`` returns. This is
+        for a turn that needs to send before it is over: a safe rule at the
+        deadline while the model is still thinking.
+        """
+        ws = self._ws
+        if ws is None:
+            return False
+        try:
+            await ws.send(json.dumps(action))
+            return True
+        except ConnectionClosed:
+            return False
+
+    def seconds_since_received(self, state: dict) -> float:
+        """How long ago ``state`` arrived on this connection (0 if unknown)."""
+        received = state.get(_RECEIVED_AT) if isinstance(state, dict) else None
+        if not isinstance(received, (int, float)):
+            return 0.0
+        return max(0.0, asyncio.get_running_loop().time() - received)
 
     async def run(
         self,
         on_tick: OnTickCallback,
         on_message: OnMessageCallback | None = None,
+        after_turn: AfterTurnCallback | None = None,
     ) -> None:
         """
         Connect and run the agent loop.
@@ -196,10 +226,14 @@ class TNEClient:
         (counted in ``states_skipped``).
         ``on_message``, if given, is called with every other server message
         (``action_queued``, ``error``, ``waiting``, ...) after it is logged.
+        ``after_turn``, if given, is awaited with the same state once the turn's
+        action has been sent: the place for work that should not delay the
+        action (a memory review).
         Blocks until the server rejects the key (4001), the agent is dormant
         (4003), or a connection ends while ``reconnect`` is False.
         """
         delay = self.reconnect_delay
+        self._after_turn = after_turn
 
         while True:
             self._authenticated = False
@@ -304,6 +338,7 @@ class TNEClient:
                 return _CLOSE_INVALID_KEY, reason
 
             self._authenticated = True
+            self._ws = ws
             logger.info("Authenticated.")
             # Reading and answering run side by side. Reading never waits for a
             # turn, so if states arrive faster than they are answered, only the
@@ -324,6 +359,11 @@ class TNEClient:
                         if isinstance(interval, (int, float)) and interval > 0:
                             self._tick_interval = float(interval)
                         logger.debug("State tick %s", tick_info.get("current_tick", "?"))
+                        msg[_RECEIVED_AT] = asyncio.get_running_loop().time()
+                        if msg.get("skipped_states"):
+                            logger.warning(
+                                "The server skipped %s state(s) this connection had not read.",
+                                msg["skipped_states"])
                         skipped = latest.put(msg)
                         if skipped is not None:
                             self.states_skipped += 1
@@ -335,16 +375,24 @@ class TNEClient:
                             )
                     elif msg_type == "action_queued":
                         logger.info(
-                            "Server confirmed: %s queued for tick %d",
+                            "Server confirmed: %s queued for tick %d%s%s",
                             msg.get("action"),
-                            msg.get("tick", 0) + 1,
+                            msg.get("runs_on_tick", msg.get("tick", 0)) + 1,
+                            " (LATE: it runs on a newer state than the one it was decided on)"
+                            if msg.get("late") else "",
+                            " (a retry of an action already queued)" if msg.get("duplicate") else "",
                         )
+                        if msg.get("warning"):
+                            logger.warning("Server: %s", msg["warning"])
                     elif msg_type == "waiting":
                         logger.info("Waiting for shard: %s", msg.get("message"))
                     elif msg_type == "heartbeat":
                         logger.debug("Heartbeat.")
                     elif msg_type == "error":
-                        logger.warning("Server error [%s]: %s", msg.get("code"), msg.get("message"))
+                        if msg.get("code") == "stale_action":
+                            logger.warning("Action not run, it arrived too late: %s", msg.get("message"))
+                        else:
+                            logger.warning("Server error [%s]: %s", msg.get("code"), msg.get("message"))
                     else:
                         logger.debug("Unknown message type: %s", msg_type)
 
@@ -363,6 +411,7 @@ class TNEClient:
                 latest.close()
                 if not answering.cancelled():
                     await asyncio.gather(answering, return_exceptions=True)
+                self._ws = None
 
         # The server closed cleanly; the async for ends without raising.
         return ws.close_code or _CLOSE_NO_STATUS, ws.close_reason or ""
@@ -429,6 +478,9 @@ class TNEClient:
                             "arrived. Sending it anyway.", current_tick,
                         )
                     await ws.send(json.dumps(action))
+                if self._after_turn is not None:
+                    # The action is on its way; this no longer holds it up.
+                    await self._after_turn(msg)
             except ConnectionClosed:
                 logger.info("Connection closed before tick %s could be answered.", current_tick)
             except Exception as exc:

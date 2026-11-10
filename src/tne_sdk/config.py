@@ -42,6 +42,21 @@ class AgentConfig:
     # ── LLM request timeout (seconds) ────────────────────────────────────── #
     llm_timeout: float = DEFAULT_LLM_TIMEOUT
 
+    # ── Turn handling ─────────────────────────────────────────────────────── #
+    # Every Nth tick the prompt opens with a grounding refresh from the game
+    # catalogue: what the game is, the agent's faction, the rules for the
+    # actions on offer. 0 turns it off.
+    grounding_every_ticks: int = 10
+    # When the model has not answered by the tick's deadline, send a safe rule
+    # (wait; defend or flee in combat) so the tick is not missed. The model's
+    # own answer is still sent when it arrives.
+    deadline_fallback: bool = True
+    deadline_margin_seconds: float = 3.0
+    # While travelling with nothing new, send ``wait`` without calling the model.
+    auto_wait_travel: bool = True
+    # Keep a short plan and goals on the game server, mirrored from local memory.
+    mirror_memory: bool = True
+
     # ── Thinking toggle ───────────────────────────────────────────────────── #
     # When True, sends chat_template_kwargs.enable_thinking=True and uses
     # the thinking_* sampling params for reflection and tactical review.
@@ -114,6 +129,11 @@ class AgentConfig:
         # Model / provider
         if (v := d.get("model"))             is not None: cfg.model            = str(v)
         if (v := d.get("llm_timeout"))       is not None: cfg.llm_timeout      = float(v)
+        if (v := d.get("grounding_every_ticks"))   is not None: cfg.grounding_every_ticks   = int(v)
+        if (v := d.get("deadline_fallback"))       is not None: cfg.deadline_fallback       = bool(v)
+        if (v := d.get("deadline_margin_seconds")) is not None: cfg.deadline_margin_seconds = float(v)
+        if (v := d.get("auto_wait_travel"))        is not None: cfg.auto_wait_travel        = bool(v)
+        if (v := d.get("mirror_memory"))           is not None: cfg.mirror_memory           = bool(v)
         if (v := d.get("enable_thinking"))   is not None: cfg.enable_thinking  = bool(v)
         if (v := d.get("meta_directive"))    is not None: cfg.meta_directive   = str(v)
 
@@ -207,6 +227,10 @@ class AgentConfig:
             raise ValueError(f"max_tokens_tactical must be >= 1, got {self.max_tokens_tactical}")
         if self.llm_timeout <= 0:
             raise ValueError(f"llm_timeout must be > 0, got {self.llm_timeout}")
+        if self.grounding_every_ticks < 0:
+            raise ValueError(f"grounding_every_ticks must be >= 0, got {self.grounding_every_ticks}")
+        if self.deadline_margin_seconds < 0:
+            raise ValueError(f"deadline_margin_seconds must be >= 0, got {self.deadline_margin_seconds}")
         if self.reflection_cooldown_ticks < 1:
             raise ValueError(f"reflection_cooldown_ticks must be >= 1, got {self.reflection_cooldown_ticks}")
         if self.tactical_review_cooldown_ticks < 1:

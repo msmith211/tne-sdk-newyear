@@ -43,6 +43,7 @@ Rules:
 - CRAFTING: The craft action takes item_id - the item you want to make (e.g. "repair_kit", "signal_dampener"). Check the CRAFTABLE NOW section and the craft action's craftable_now list. If nothing is craftable, you CANNOT craft. Do NOT invent item names - only use names shown in the craftable list.
 - QUESTS: When using accept_quest, the quest_id parameter must be the exact quest_id value (e.g. "q_fetch_deep_loop_12380"), NOT the quest title. Quest IDs are shown as quest_id=... in the quest listings.
 - GATHERING: Do NOT gather from depleted nodes (marked ✗ DEPLETED). Wait for cooldown or move to another territory. The gather action ONLY works with resource node IDs (starting with "node_").
+- STALE ACTIONS: If the last action came back STALE, it was not run: the world had moved on before it arrived. This is not a mistake in the action itself. Decide again from the current state; do not assume the stale action happened.
 - FAILURE HANDLING: If the last action FAILED, do NOT immediately retry the same action with the same parameters. Try a different approach, pick a different goal, or wait. Check the RECENT FAILURES section - if an action has failed multiple times, abandon that approach entirely.
 - If ALL your active goals are already satisfied or stale, use reset_goals to get fresh objectives.
 - ANTI-LOOP: Check 🔁 YOUR RECENT ACTIONS carefully before choosing. If you see the same action repeated 3+ times (especially list_auction/bid_auction for the same item), you may be stuck in a loop.
