@@ -329,6 +329,8 @@ class Agent:
         self._last_memory_sent: dict | None = None   # the last plan/goals mirrored to the server
         self._fallback_action_id: str | None = None  # id of a fallback sent this turn, if any
         self.fallbacks_sent = 0                      # safe rules sent because the model was not in time
+        self._thinking_turns: list[tuple[float, float | None]] = []   # (seconds taken, seconds a full tick allows)
+        self._action_thinking_stopped = False        # "auto" gave up thinking on action turns
         self.auto_waits = 0                          # turns answered without calling the model
 
     # ── Public API ────────────────────────────────────────────────────────── #
@@ -617,9 +619,13 @@ class Agent:
             waited = self.client.seconds_since_received(state)
         budget = turns.DecisionBudget.from_state(state, waited, self.config.deadline_margin_seconds)
 
+        full = turns.DecisionBudget.from_state(state, 0.0, self.config.deadline_margin_seconds).seconds
+        thought = self._action_thinks()
+
         def report(_: Any) -> None:
-            logger.info(turns.timing_line(
-                tick, time.monotonic() - started, budget.seconds, getattr(self.llm, "last_usage", None)))
+            took = time.monotonic() - started
+            logger.info(turns.timing_line(tick, took, budget.seconds, getattr(self.llm, "last_usage", None)))
+            self._note_turn_time(tick, took, full, thought)
         call.add_done_callback(report)
 
         if not self.config.deadline_fallback or send is None:
@@ -629,6 +635,11 @@ class Agent:
         done, _ = await asyncio.wait({call}, timeout=budget.seconds)
         if done:
             return call.result()
+        if getattr(self.client, "late_action_runs_on", None) == turns.tick_of(state):
+            # The answer to the last state came late and is queued for this
+            # very tick. A fallback would replace it with a wait.
+            logger.info("Tick %s: no fallback sent; the agent's own late action already runs this tick.", tick)
+            return await call
         fallback = turns.fallback_action(state)
         self._action_serial += 1
         stamped = turns.stamp(fallback, state, self._session_id, self._action_serial)
@@ -930,7 +941,27 @@ class Agent:
 
     # ── LLM helpers ───────────────────────────────────────────────────────── #
 
-    def _system_prompt_for(self, base_prompt: str) -> str:
+    def _action_thinks(self) -> bool:
+        """Whether this action turn runs with thinking on."""
+        if not self.config.enable_thinking or self.config.action_thinking == "off":
+            return False
+        return self.config.action_thinking == "on" or not self._action_thinking_stopped
+
+    def _note_turn_time(self, tick: Any, seconds: float, full_budget: float | None, thought: bool) -> None:
+        """Stop thinking on action turns once it keeps costing the deadline (``action_thinking: auto``)."""
+        if not thought or self.config.action_thinking != "auto" or self._action_thinking_stopped:
+            return
+        self._thinking_turns = [*self._thinking_turns, (seconds, full_budget)][-turns.SLOW_TURNS_BEFORE_THINKING_STOPS:]
+        if turns.too_slow_to_think(self._thinking_turns):
+            self._action_thinking_stopped = True
+            logger.warning(
+                "Tick %s: the last %d action turns each took longer than a whole tick with thinking on "
+                "(%s). Thinking is now off for action turns, so the agent can act every tick; "
+                "reflection and tactical reviews still think. Set action_thinking to \"on\" to keep it.",
+                tick, len(self._thinking_turns),
+                ", ".join(f"{took:.0f}s of {full:.0f}s" for took, full in self._thinking_turns))
+
+    def _system_prompt_for(self, base_prompt: str, thinking: bool | None = None) -> str:
         """
         Return the system prompt with /no_think appended when thinking is off.
 
@@ -943,11 +974,11 @@ class Agent:
         if self.live_persona_prompt:
             prompt += f"\n\nLIVE PERSONA / INSTRUCTIONS:\n{self.live_persona_prompt}"
 
-        if self.config.enable_thinking:
+        if self.config.enable_thinking if thinking is None else thinking:
             return prompt
         return prompt + prompts.NO_THINK_HINT
 
-    def _effective_max_tokens(self, base: int) -> int:
+    def _effective_max_tokens(self, base: int, thinking: bool | None = None) -> int:
         """
         When thinking is enabled, the model's <think> block consumes tokens
         from the same max_tokens budget.  If the budget is too small the
@@ -957,7 +988,7 @@ class Agent:
         so the model has room for both the reasoning chain and the JSON
         response.  Users who set explicit high values keep them as-is.
         """
-        if not self.config.enable_thinking:
+        if not (self.config.enable_thinking if thinking is None else thinking):
             return base
         return max(base * 2, 4096)
 
@@ -965,8 +996,8 @@ class Agent:
         kwargs = self.config.default_llm_kwargs.copy()
         kwargs.setdefault("top_k", self.config.top_k)
         kwargs.setdefault("presence_penalty", self.config.presence_penalty)
-        thinking_mode = self.config.enable_thinking
-        sys_prompt = self._system_prompt_for(self.system_prompt)
+        thinking_mode = self._action_thinks()
+        sys_prompt = self._system_prompt_for(self.system_prompt, thinking_mode)
 
         self._log_payload("REQUEST/action", {
             "tick": tick,
@@ -984,7 +1015,7 @@ class Agent:
                         Message(role="user",   content=user_prompt),
                     ],
                     model         = self.config.model,
-                    max_tokens    = self._effective_max_tokens(self.config.max_tokens_action),
+                    max_tokens    = self._effective_max_tokens(self.config.max_tokens_action, thinking_mode),
                     temperature   = eff_temp,
                     top_p         = self.config.top_p,
                     thinking_mode = thinking_mode,

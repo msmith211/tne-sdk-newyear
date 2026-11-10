@@ -168,3 +168,18 @@ def timing_line(tick: Any, seconds: float, budget: float | None, usage: Mapping[
     if usage.get("reasoning_chars"):
         parts.append(f"{int(usage['reasoning_chars'])} characters of hidden reasoning")
     return ", ".join(parts) + "."
+
+
+SLOW_TURNS_BEFORE_THINKING_STOPS = 3
+
+
+def too_slow_to_think(recent: Sequence[tuple[float, float | None]],
+                      needed: int = SLOW_TURNS_BEFORE_THINKING_STOPS) -> bool:
+    """Whether the last ``needed`` thinking turns each took longer than a whole tick allows.
+
+    ``recent`` is (seconds taken, seconds a turn has when it starts on time),
+    newest last. A turn that only missed because it started late does not
+    count: the test is against the whole tick, not what was left of it.
+    """
+    last = list(recent)[-needed:]
+    return len(last) == needed and all(full is not None and took > full for took, full in last)

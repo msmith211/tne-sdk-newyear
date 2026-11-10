@@ -563,3 +563,50 @@ def test_timing_line_says_what_made_a_turn_slow():
     assert "628 tokens out at 20/s" in line and "3300 tokens in" in line and "1800 characters of hidden reasoning" in line
     assert turns.timing_line(5, 4.0, None, None) == "Tick 5: the model answered in 4.0s."
     assert "(LATE)" not in turns.timing_line(5, 4.0, 27.0, {})
+
+
+class TestSlowModels:
+    def test_a_fallback_does_not_replace_the_agents_own_late_action(self):
+        client = _Client()
+        client.late_action_runs_on = 8          # the answer to tick 7 came late and runs on tick 8
+        agent = _agent(_Model(delay=0.4), client, deadline_margin_seconds=0.0)
+        action = _turn(agent, _playable(8, deadline_at_ms=100_100, server_now_ms=100_000))
+        assert client.sent == [] and agent.fallbacks_sent == 0
+        assert action["action"] == "gather" and action["based_on_tick"] == 8
+
+    def test_a_late_action_for_an_earlier_tick_does_not_hold_the_fallback_back(self):
+        client = _Client()
+        client.late_action_runs_on = 6
+        agent = _agent(_Model(delay=0.4), client, deadline_margin_seconds=0.0)
+        _turn(agent, _playable(8, deadline_at_ms=100_100, server_now_ms=100_000))
+        assert len(client.sent) == 1 and agent.fallbacks_sent == 1
+
+    def test_thinking_stops_on_action_turns_once_it_keeps_missing_the_deadline(self):
+        agent = _agent(_Model(delay=0.25), enable_thinking=True, deadline_margin_seconds=0.0,
+                       deadline_fallback=False)
+        for tick in (7, 8, 9):
+            assert agent._action_thinks()
+            _turn(agent, _playable(tick, deadline_at_ms=100_100, server_now_ms=100_000))   # 0.1 s a tick
+        assert not agent._action_thinks()
+        assert agent._effective_max_tokens(2048, agent._action_thinks()) == 2048
+        assert agent._effective_max_tokens(6144) == 12288          # reviews still think
+
+    def test_thinking_that_fits_the_tick_is_left_on(self):
+        agent = _agent(enable_thinking=True, deadline_margin_seconds=0.0)
+        for tick in (7, 8, 9, 10):
+            _turn(agent, _playable(tick, deadline_at_ms=160_000, server_now_ms=100_000))
+        assert agent._action_thinks()
+
+    def test_thinking_can_be_kept_on_or_off_for_action_turns(self):
+        kept = _agent(_Model(delay=0.25), enable_thinking=True, action_thinking="on",
+                      deadline_margin_seconds=0.0, deadline_fallback=False)
+        for tick in (7, 8, 9):
+            _turn(kept, _playable(tick, deadline_at_ms=100_100, server_now_ms=100_000))
+        assert kept._action_thinks()
+        assert not _agent(enable_thinking=True, action_thinking="off")._action_thinks()
+
+    def test_a_turn_that_only_started_late_does_not_count_against_thinking(self):
+        assert turns.too_slow_to_think([(40, 27), (35, 27), (31, 27)])
+        assert not turns.too_slow_to_think([(40, 27), (20, 27), (31, 27)])
+        assert not turns.too_slow_to_think([(40, 27), (35, 27)])
+        assert not turns.too_slow_to_think([(40, None), (35, None), (31, None)])

@@ -186,6 +186,8 @@ class TNEClient:
         self._tick_interval = _DEFAULT_TICK_INTERVAL
         self._ws = None           # the live connection, for send() during a turn
         self._after_turn: AfterTurnCallback | None = None
+        # The tick a late action of ours was last queued to run on, if any.
+        self.late_action_runs_on: int | None = None
 
     async def send(self, action: dict) -> bool:
         """Send an action now, from inside a turn. False if there is no connection.
@@ -382,6 +384,8 @@ class TNEClient:
                             if msg.get("late") else "",
                             " (a retry of an action already queued)" if msg.get("duplicate") else "",
                         )
+                        if msg.get("late") and isinstance(msg.get("runs_on_tick"), int):
+                            self.late_action_runs_on = msg["runs_on_tick"]
                         if msg.get("warning"):
                             logger.warning("Server: %s", msg["warning"])
                     elif msg_type == "waiting":

@@ -10,6 +10,13 @@ Season 4 work. Not published.
 
 ### Added
 
+- **Slow local models.** Each turn logs how long the model took against the
+  time it had, with tokens out, tokens a second and any hidden reasoning. With
+  thinking on, `action_thinking: auto` (the default) stops thinking on action
+  turns once three in a row each take longer than a whole tick; reviews keep
+  thinking. `on` and `off` fix it either way. A local server that reasons with
+  thinking off is asked again with `reasoning_effort`. The deadline fallback
+  no longer replaces the agent's own late action queued for the same tick.
 - **Actions say which state they were decided on.** Every action carries
   `based_on_tick` and an `action_id`. A server that understands them runs a
   late action only if it is still safe to, and turns a stale one away; the

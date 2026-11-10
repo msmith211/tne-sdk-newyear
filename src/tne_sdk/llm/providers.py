@@ -253,6 +253,12 @@ class OpenAICompatibleProvider(LLMProvider):
             timeout=timeout,
         )
         self.last_usage: dict[str, int] = {}    # token counts of the last call
+        # Thinking is switched off through chat_template_kwargs, which not every
+        # server reads. When a model reasons anyway, the next calls also ask with
+        # ``reasoning_effort``; a server that refuses that is not asked again.
+        self._reasoned_when_off = False
+        self._effort_switch_refused = False
+        self._told_still_reasoning = False
 
     def chat_completion(
         self,
@@ -280,10 +286,34 @@ class OpenAICompatibleProvider(LLMProvider):
         # Thinking toggle via chat_template_kwargs (Qwen3, Qwen3.5, vLLM, SGLang)
         body.setdefault("chat_template_kwargs", {})["enable_thinking"] = thinking_mode
 
+        effort_switch = (
+            not thinking_mode and self._reasoned_when_off and not self._effort_switch_refused
+            and "reasoning_effort" not in body
+        )
+        if effort_switch:
+            body["reasoning_effort"] = "none"
         response = self._http.post(self._completions_url, json=body)
+        if effort_switch and response.status_code in (400, 422):
+            self._effort_switch_refused = True
+            del body["reasoning_effort"]
+            logger.warning(
+                "This server does not accept reasoning_effort, so the model's thinking cannot be "
+                "switched off from here. Switch it off in the server's own settings for this model.")
+            response = self._http.post(self._completions_url, json=body)
         response.raise_for_status()
         data = response.json()
         msg = data["choices"][0]["message"]
+        if not thinking_mode and (msg.get("reasoning_content") or "<think>" in (msg.get("content") or "")):
+            if not self._reasoned_when_off:
+                self._reasoned_when_off = True
+                logger.warning(
+                    "Thinking is off, but the model reasoned before answering, which makes every "
+                    "turn slower. Asking again with reasoning_effort from the next call.")
+            elif effort_switch and not self._told_still_reasoning:
+                self._told_still_reasoning = True
+                logger.warning(
+                    "The model still reasons with thinking switched off both ways. Switch it off in "
+                    "the server's own settings for this model, or set it in default_llm_kwargs.")
         usage = data.get("usage") or {}
         self.last_usage = {
             ours: int(usage[theirs])

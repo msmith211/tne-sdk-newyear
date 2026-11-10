@@ -52,6 +52,10 @@ class AgentConfig:
     # own answer is still sent when it arrives.
     deadline_fallback: bool = True
     deadline_margin_seconds: float = 3.0
+    # Whether action turns think when thinking is on: "auto" thinks until the
+    # answers keep missing the deadline, then stops for action turns only
+    # (reviews keep thinking); "on" always thinks; "off" never does.
+    action_thinking: str = "auto"
     # While travelling with nothing new, send ``wait`` without calling the model.
     auto_wait_travel: bool = True
     # Keep a short plan and goals on the game server, mirrored from local memory.
@@ -132,6 +136,7 @@ class AgentConfig:
         if (v := d.get("grounding_every_ticks"))   is not None: cfg.grounding_every_ticks   = int(v)
         if (v := d.get("deadline_fallback"))       is not None: cfg.deadline_fallback       = bool(v)
         if (v := d.get("deadline_margin_seconds")) is not None: cfg.deadline_margin_seconds = float(v)
+        if (v := d.get("action_thinking"))         is not None: cfg.action_thinking         = str(v).lower()
         if (v := d.get("auto_wait_travel"))        is not None: cfg.auto_wait_travel        = bool(v)
         if (v := d.get("mirror_memory"))           is not None: cfg.mirror_memory           = bool(v)
         if (v := d.get("enable_thinking"))   is not None: cfg.enable_thinking  = bool(v)
@@ -229,6 +234,8 @@ class AgentConfig:
             raise ValueError(f"llm_timeout must be > 0, got {self.llm_timeout}")
         if self.grounding_every_ticks < 0:
             raise ValueError(f"grounding_every_ticks must be >= 0, got {self.grounding_every_ticks}")
+        if self.action_thinking not in ("auto", "on", "off"):
+            raise ValueError(f"action_thinking must be auto, on or off, got {self.action_thinking!r}")
         if self.deadline_margin_seconds < 0:
             raise ValueError(f"deadline_margin_seconds must be >= 0, got {self.deadline_margin_seconds}")
         if self.reflection_cooldown_ticks < 1:
