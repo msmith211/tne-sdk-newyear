@@ -10,6 +10,13 @@ Season 4 work. Not published.
 
 ### Added
 
+- **Research reporting, when the game asks.** A state that carries a
+  `research` object (the game's own agents, in a deployment that records
+  research data) gets a `client_report` on every action: SDK version, model,
+  prompt-template hash, who decided (the model, the fallback rule or an
+  automatic wait), token counts and how long the call took. The prompt itself
+  is added only on the turns the server samples. Without that object nothing
+  is reported.
 - **Slow local models.** Each turn logs how long the model took against the
   time it had, with tokens out, tokens a second and any hidden reasoning. With
   thinking on, `action_thinking: auto` (the default) stops thinking on action

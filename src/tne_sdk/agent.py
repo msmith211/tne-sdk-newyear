@@ -219,6 +219,12 @@ def _normalise_action_params(action: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+
+def _sdk_version() -> str:
+    from . import __version__
+    return __version__
+
+
 class Agent:
     """
     The core TNE SDK Agent.
@@ -330,6 +336,7 @@ class Agent:
         self._fallback_action_id: str | None = None  # id of a fallback sent this turn, if any
         self.fallbacks_sent = 0                      # safe rules sent because the model was not in time
         self._thinking_turns: list[tuple[float, float | None]] = []   # (seconds taken, seconds a full tick allows)
+        self._last_call: dict[str, Any] = {}         # the last action call: tick, seconds, tokens, prompt
         self._action_thinking_stopped = False        # "auto" gave up thinking on action turns
         self.auto_waits = 0                          # turns answered without calling the model
 
@@ -416,10 +423,24 @@ class Agent:
             await self._after_turn(state)
         return self._outgoing(action, state or {})
 
+    def _add_client_report(self, out: dict[str, Any], state: dict, source: str) -> None:
+        """Add this software's own report to an outgoing action, if the server asked for one."""
+        call = self._last_call if self._last_call.get("tick") == turns.tick_of(state) else {}
+        prompt = call.get("prompt")
+        report = turns.client_report(
+            state, sdk_version=_sdk_version(), model=self.config.model, decision_source=source,
+            usage=call.get("usage"), latency_ms=call.get("latency_ms"), thinking=call.get("thinking"),
+            prompt_template_hash=turns.template_hash(self.system_prompt),
+            prompt=f"{self._system_prompt_for(self.system_prompt, call.get('thinking'))}\n\n{prompt}" if prompt else None)
+        if report is not None:
+            out["client_report"] = report
+
     def _outgoing(self, action: dict[str, Any], state: dict) -> dict[str, Any]:
         """An action as it goes on the wire."""
         self._action_serial += 1
+        source = action.get("decision_source") or turns.SOURCE_MODEL
         out = turns.stamp(action, state, self._session_id, self._action_serial)
+        self._add_client_report(out, state, source)
         if self._fallback_action_id:
             # This turn already sent a fallback. The model's answer takes its
             # id, so the server sees one action updated, not a second action
@@ -624,8 +645,12 @@ class Agent:
 
         def report(_: Any) -> None:
             took = time.monotonic() - started
-            logger.info(turns.timing_line(tick, took, budget.seconds, getattr(self.llm, "last_usage", None)))
+            usage = dict(getattr(self.llm, "last_usage", None) or {})
+            logger.info(turns.timing_line(tick, took, budget.seconds, usage))
             self._note_turn_time(tick, took, full, thought)
+            # Kept now, before a review's call replaces the provider's token counts.
+            self._last_call = {"tick": turns.tick_of(state), "latency_ms": took * 1000, "usage": usage,
+                               "thinking": thought, "prompt": user_prompt}
         call.add_done_callback(report)
 
         if not self.config.deadline_fallback or send is None:
@@ -643,6 +668,7 @@ class Agent:
         fallback = turns.fallback_action(state)
         self._action_serial += 1
         stamped = turns.stamp(fallback, state, self._session_id, self._action_serial)
+        self._add_client_report(stamped, state, turns.SOURCE_FALLBACK)
         if await send(stamped):
             self._fallback_action_id = stamped["action_id"]
             self.fallbacks_sent += 1

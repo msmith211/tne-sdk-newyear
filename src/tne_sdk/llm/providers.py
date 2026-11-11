@@ -320,6 +320,9 @@ class OpenAICompatibleProvider(LLMProvider):
             for ours, theirs in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"))
             if isinstance(usage.get(theirs), (int, float))
         }
+        details = usage.get("completion_tokens_details")
+        if isinstance(details, dict) and isinstance(details.get("reasoning_tokens"), (int, float)):
+            self.last_usage["reasoning_tokens"] = int(details["reasoning_tokens"])
         if msg.get("reasoning_content"):
             self.last_usage["reasoning_chars"] = len(msg["reasoning_content"])
 

@@ -610,3 +610,60 @@ class TestSlowModels:
         assert not turns.too_slow_to_think([(40, 27), (20, 27), (31, 27)])
         assert not turns.too_slow_to_think([(40, 27), (35, 27)])
         assert not turns.too_slow_to_think([(40, None), (35, None), (31, None)])
+
+
+class TestClientReport:
+    ASKED = {"research": {"report": "full", "prompt_sample": False}}
+
+    def test_nothing_is_reported_unless_the_server_asks(self):
+        agent = _agent()
+        action = _turn(agent, _playable(7))
+        assert "client_report" not in action
+        assert turns.client_report({}, sdk_version="1", model="m", decision_source="model") is None
+        assert turns.client_report({"research": {"report": ""}}, sdk_version="1", model="m",
+                                   decision_source="model") is None
+
+    def test_a_model_decision_reports_its_model_tokens_and_time(self):
+        model = _Model()
+        model.last_usage = {"input_tokens": 3005, "output_tokens": 68, "cache_creation_input_tokens": 1200,
+                            "reasoning_chars": 40}
+        agent = _agent(model)
+        agent.config.model = "gemma-4-12b"
+        report = _turn(agent, _playable(7, **self.ASKED))["client_report"]
+        assert report["decision_source"] == "model" and report["model"] == "gemma-4-12b"
+        assert report["sdk_version"] and len(report["prompt_template_hash"]) == 16
+        assert (report["input_tokens"], report["output_tokens"], report["cache_write_input_tokens"]) == (3005, 68, 1200)
+        assert report["latency_ms"] >= 0 and report["thinking"] is False
+        assert "prompt_sample" not in report and "reasoning_chars" not in report
+
+    def test_the_prompt_is_sent_only_on_a_sampled_turn(self):
+        agent = _agent()
+        sampled = _playable(7, research={"report": "full", "prompt_sample": True})
+        report = _turn(agent, sampled)["client_report"]
+        assert "node_scrap_1" in report["prompt_sample"] and len(report["prompt_sample"]) > 200
+
+    def test_an_automatic_wait_says_no_model_was_called(self):
+        agent = _agent()
+        report = _turn(agent, _playable(7, travel=_TRAVEL, **self.ASKED))["client_report"]
+        assert report["decision_source"] == "auto_wait"
+        assert "output_tokens" not in report and "latency_ms" not in report and "prompt_sample" not in report
+
+    def test_a_fallback_is_reported_as_a_fallback_and_the_answer_as_the_model(self):
+        client = _Client()
+        agent = _agent(_Model(delay=0.4), client, deadline_margin_seconds=0.0)
+        action = _turn(agent, _playable(7, deadline_at_ms=100_100, server_now_ms=100_000, **self.ASKED))
+        (fallback,) = client.sent
+        assert fallback["client_report"]["decision_source"] == "fallback_rule"
+        assert "latency_ms" not in fallback["client_report"]
+        assert action["client_report"]["decision_source"] == "model" and action["client_report"]["latency_ms"] >= 300
+
+    def test_last_turns_tokens_are_not_reported_for_this_one(self):
+        model = _Model()
+        model.last_usage = {"output_tokens": 68}
+        agent = _agent(model)
+        _turn(agent, _playable(7, **self.ASKED))
+        report = _turn(agent, _playable(8, travel=_TRAVEL, **self.ASKED))["client_report"]
+        assert "output_tokens" not in report
+
+    def test_the_template_hash_names_the_template(self):
+        assert turns.template_hash("a", "b") == turns.template_hash("a", "b") != turns.template_hash("ab")

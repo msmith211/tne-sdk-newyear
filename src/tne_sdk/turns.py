@@ -183,3 +183,60 @@ def too_slow_to_think(recent: Sequence[tuple[float, float | None]],
     """
     last = list(recent)[-needed:]
     return len(last) == needed and all(full is not None and took > full for took, full in last)
+
+
+_USAGE_FIELDS = {
+    "input_tokens": "input_tokens", "output_tokens": "output_tokens",
+    "cache_read_input_tokens": "cache_read_input_tokens",
+    "cache_creation_input_tokens": "cache_write_input_tokens",
+    "cache_write_input_tokens": "cache_write_input_tokens",
+    "reasoning_tokens": "reasoning_tokens",
+}
+
+
+def template_hash(*texts: str | None) -> str:
+    """A short, stable name for a prompt template: the same texts always give the same hash."""
+    import hashlib
+    joined = "\x1f".join(text or "" for text in texts)
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def client_report(
+    state: Mapping[str, Any],
+    *,
+    sdk_version: str,
+    model: str | None,
+    decision_source: str,
+    usage: Mapping[str, Any] | None = None,
+    latency_ms: float | None = None,
+    thinking: bool | None = None,
+    prompt_template_hash: str | None = None,
+    prompt: str | None = None,
+) -> dict[str, Any] | None:
+    """What this software says about a decision, when the server asks for it.
+
+    A state carries a ``research`` object only for an agent whose game records
+    research data about it (the game's own agents). For everyone else this is
+    None and nothing about the model or its cost leaves the machine. The prompt
+    itself is added only on the turns the server samples.
+    """
+    asked = state.get("research")
+    if not isinstance(asked, Mapping) or not asked.get("report"):
+        return None
+    report: dict[str, Any] = {"sdk_version": sdk_version, "decision_source": decision_source}
+    if model:
+        report["model"] = str(model)
+    if prompt_template_hash:
+        report["prompt_template_hash"] = prompt_template_hash
+    if thinking is not None:
+        report["thinking"] = bool(thinking)
+    if decision_source == SOURCE_MODEL:
+        for ours, theirs in _USAGE_FIELDS.items():
+            value = (usage or {}).get(ours)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                report[theirs] = int(value)
+        if latency_ms is not None:
+            report["latency_ms"] = int(latency_ms)
+        if asked.get("prompt_sample") and prompt:
+            report["prompt_sample"] = prompt
+    return report
