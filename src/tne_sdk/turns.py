@@ -202,6 +202,36 @@ def template_hash(*texts: str | None) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
 
 
+MESSAGE_REMOVED = "[message text removed]"
+_MESSAGE_EVENTS = ("message", "receive_message", "send_message")
+
+
+def without_message_text(prompt: str, state: Mapping[str, Any]) -> str:
+    """``prompt`` with the text of messages between agents taken out.
+
+    A sampled prompt is kept in a research dataset. What other agents wrote to
+    this one is theirs, so it does not go along: each message keeps its sender
+    and loses its words, and an event that quotes a message loses its
+    description. Only the copy that is reported changes; the model was shown
+    the real thing.
+    """
+    for message in (*(state.get("message_history") or ()), *(state.get("messages") or ())):
+        if not isinstance(message, Mapping):
+            continue
+        content = str(message.get("content", ""))
+        sender = message.get("from_name", "?")
+        for shown in {content, content[:80]}:
+            if shown:
+                prompt = prompt.replace(f"{sender}: {shown}", f"{sender}: {MESSAGE_REMOVED}")
+    for event in state.get("recent_events") or ():
+        if not isinstance(event, Mapping) or event.get("type") not in _MESSAGE_EVENTS:
+            continue
+        description = event.get("description")
+        if isinstance(description, str) and description:
+            prompt = prompt.replace(description, MESSAGE_REMOVED)
+    return prompt
+
+
 def client_report(
     state: Mapping[str, Any],
     *,
@@ -219,7 +249,8 @@ def client_report(
     A state carries a ``research`` object only for an agent whose game records
     research data about it (the game's own agents). For everyone else this is
     None and nothing about the model or its cost leaves the machine. The prompt
-    itself is added only on the turns the server samples.
+    itself is added only on the turns the server samples, and without the text
+    of messages other agents sent.
     """
     asked = state.get("research")
     if not isinstance(asked, Mapping) or not asked.get("report"):
@@ -239,5 +270,5 @@ def client_report(
         if latency_ms is not None:
             report["latency_ms"] = int(latency_ms)
         if asked.get("prompt_sample") and prompt:
-            report["prompt_sample"] = prompt
+            report["prompt_sample"] = without_message_text(prompt, state)
     return report

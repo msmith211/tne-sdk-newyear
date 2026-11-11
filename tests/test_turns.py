@@ -662,6 +662,29 @@ class TestClientReport:
         report = _turn(agent, sampled)["client_report"]
         assert "node_scrap_1" in report["prompt_sample"] and len(report["prompt_sample"]) > 200
 
+    def test_a_sampled_prompt_leaves_out_what_other_agents_wrote(self):
+        secret = "Meet me at the exchange at tick 90, I will sell you the cipher key for 40 credits, tell nobody"
+        state = _playable(
+            7, research={"report": "full", "prompt_sample": True},
+            message_history=[{"from_name": "Vex-9", "content": secret, "tick_sent": 6},
+                             {"from_name": "Orrin", "content": "ok", "tick_sent": 5}],
+            recent_events=[{"type": "receive_message", "tick": 6, "description": f"Vex-9 says: {secret}"},
+                           {"type": "gather", "tick": 5, "description": "Gathered 3x scrap_metal."}])
+        model = _Model()
+        sample = _turn(_agent(model), state)["client_report"]["prompt_sample"]
+        assert "cipher key" in model.prompts[0]                      # the model saw the real prompt
+        assert "cipher key" not in sample and "Meet me" not in sample
+        assert f"Vex-9: {turns.MESSAGE_REMOVED}" in sample and f"Orrin: {turns.MESSAGE_REMOVED}" in sample
+        assert "Gathered 3x scrap_metal." in sample                  # everything else is as it was
+        assert "node_scrap_1" in sample
+
+    def test_removing_message_text_touches_nothing_else(self):
+        prompt = "Location: rust_wastes\n  Orrin: ok\nYou are ok to gather. Stock: 3"
+        state = {"message_history": [{"from_name": "Orrin", "content": "ok"}]}
+        assert turns.without_message_text(prompt, state) == (
+            f"Location: rust_wastes\n  Orrin: {turns.MESSAGE_REMOVED}\nYou are ok to gather. Stock: 3")
+        assert turns.without_message_text(prompt, {}) == prompt
+
     def test_an_automatic_wait_says_no_model_was_called(self):
         agent = _agent()
         report = _turn(agent, _playable(7, travel=_TRAVEL, **self.ASKED))["client_report"]

@@ -8,6 +8,13 @@ version are also published on the
 
 Season 4 work. Not published.
 
+### Changed
+
+- **Sampled prompts leave out what other agents wrote.** A prompt sent in
+  `client_report` for the research dataset keeps each message's sender and
+  drops its text, and drops the description of any event that quotes a
+  message. The model is still shown the real prompt.
+
 ### Fixed
 
 - **Found in the final review of the Season 4 work.**
