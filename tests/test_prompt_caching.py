@@ -74,7 +74,7 @@ class TestBedrock:
             assert provider.chat_completion(messages=_MESSAGES) == "ok"
             sent = provider._client.converse.call_args.kwargs
             assert sent["system"] == [{"text": "You are an agent."}, {"cachePoint": {"type": "default"}}]
-            assert provider.last_usage == {"inputTokens": 300, "outputTokens": 40, "cacheReadInputTokens": 1400}
+            assert provider.last_usage == {"input_tokens": 300, "output_tokens": 40, "cache_read_input_tokens": 1400}
 
     def test_other_models_are_sent_none(self):
         provider = _bedrock("mistral.ministral-3-8b-instruct")

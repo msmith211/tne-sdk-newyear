@@ -332,11 +332,11 @@ class Agent:
         self._action_serial = 0
         self._catalog: dict | None = None            # the game catalogue, read once per run
         self._review_due: str | None = None          # "reflection" or "tactical", run after the turn
-        self._last_memory_sent: dict | None = None   # the last plan/goals mirrored to the server
         self._fallback_action_id: str | None = None  # id of a fallback sent this turn, if any
         self.fallbacks_sent = 0                      # safe rules sent because the model was not in time
         self._thinking_turns: list[tuple[float, float | None]] = []   # (seconds taken, seconds a full tick allows)
         self._last_call: dict[str, Any] = {}         # the last action call: tick, seconds, tokens, prompt
+        self._action_usage: dict[str, Any] = {}      # token counts of the current turn's action calls
         self._action_thinking_stopped = False        # "auto" gave up thinking on action turns
         self.auto_waits = 0                          # turns answered without calling the model
 
@@ -455,8 +455,7 @@ class Agent:
         """The plan and goals to send to the server this turn, or None.
 
         Sent only to a server that keeps memory (its state carries ``memory``),
-        and only when what the server holds differs from the local summary and
-        this summary has not just been sent.
+        and only when what the server holds differs from the local summary.
         """
         held = state.get("memory")
         if not self.config.mirror_memory or not isinstance(held, dict):
@@ -471,11 +470,10 @@ class Agent:
         patch = turns.server_memory_patch(tasks, narrative if isinstance(narrative, str) else "")
         if not patch["plan"] and not patch["goals"]:
             return None     # nothing to say yet: leave whatever the server holds alone
-        if patch == self._last_memory_sent:
-            return None
         if patch["plan"] == held.get("plan") and patch["goals"] == (held.get("goals") or []):
             return None
-        self._last_memory_sent = patch
+        # Sent again every turn until the server's own copy matches: the action
+        # carrying it may be turned away as stale, replaced or lost.
         return patch
 
     async def _after_turn(self, state: dict) -> None:
@@ -645,7 +643,7 @@ class Agent:
 
         def report(_: Any) -> None:
             took = time.monotonic() - started
-            usage = dict(getattr(self.llm, "last_usage", None) or {})
+            usage = dict(self._action_usage)
             logger.info(turns.timing_line(tick, took, budget.seconds, usage))
             self._note_turn_time(tick, took, full, thought)
             # Kept now, before a review's call replaces the provider's token counts.
@@ -1018,6 +1016,18 @@ class Agent:
             return base
         return max(base * 2, 4096)
 
+    def _clear_provider_usage(self) -> None:
+        try:
+            self.llm.last_usage = {}
+        except Exception:
+            pass
+
+    def _add_action_usage(self) -> None:
+        """Add the provider's counts for the call just made to this turn's total."""
+        for name, value in (getattr(self.llm, "last_usage", None) or {}).items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                self._action_usage[name] = self._action_usage.get(name, 0) + value
+
     async def _get_llm_action(self, user_prompt: str, tick: Any) -> dict[str, Any]:
         kwargs = self.config.default_llm_kwargs.copy()
         kwargs.setdefault("top_k", self.config.top_k)
@@ -1031,9 +1041,14 @@ class Agent:
             "user": user_prompt,
         }, tick)
 
+        # Token counts of this turn's own calls, added up over a retry. The
+        # provider's counts are cleared first: a call that fails must not be
+        # reported with the counts of whatever call came before it.
+        self._action_usage = {}
         for attempt in range(2):
             try:
                 eff_temp = self.live_temperature if self.live_temperature is not None else self.config.temperature
+                self._clear_provider_usage()
                 response_text = await asyncio.to_thread(
                     self.llm.chat_completion,
                     messages=[
@@ -1048,6 +1063,7 @@ class Agent:
                     **kwargs,
                 )
 
+                self._add_action_usage()
                 self._log_payload("RESPONSE/action", {"response": response_text}, tick)
 
                 # Extract <think> trace before _repair_json strips it.
@@ -1068,11 +1084,13 @@ class Agent:
                     )
                     continue
                 logger.error("JSON parse failed twice on tick %s, giving up.", tick)
-                return {"action": "wait", "reasoning": "LLM returned unparseable response."}
+                return {"action": "wait", "reasoning": "LLM returned unparseable response.",
+                        "decision_source": turns.SOURCE_ERROR}
 
             except Exception as exc:
                 logger.error("LLM action call failed on tick %s: %s", tick, exc, exc_info=True)
-                return {"action": "wait", "reasoning": f"LLM call failed: {type(exc).__name__}"}
+                return {"action": "wait", "reasoning": f"LLM call failed: {type(exc).__name__}",
+                        "decision_source": turns.SOURCE_ERROR}
 
     # ── Reflection ────────────────────────────────────────────────────────── #
 

@@ -22,6 +22,7 @@ from typing import Any, Mapping, Sequence
 SOURCE_MODEL    = "model"
 SOURCE_FALLBACK = "fallback_rule"
 SOURCE_AUTO     = "auto_wait"
+SOURCE_ERROR    = "model_error"      # the model was called and gave nothing usable
 
 # Server limits for the mirrored memory (see the game's API docs, "Your Memory").
 PLAN_CHARS, GOAL_CHARS, GOALS_KEPT = 400, 120, 5
@@ -230,7 +231,7 @@ def client_report(
         report["prompt_template_hash"] = prompt_template_hash
     if thinking is not None:
         report["thinking"] = bool(thinking)
-    if decision_source == SOURCE_MODEL:
+    if decision_source in (SOURCE_MODEL, SOURCE_ERROR):
         for ours, theirs in _USAGE_FIELDS.items():
             value = (usage or {}).get(ours)
             if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:

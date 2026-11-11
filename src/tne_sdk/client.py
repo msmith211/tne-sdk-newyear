@@ -428,38 +428,44 @@ class TNEClient:
         while (msg := await latest.take()) is not None:
             current_tick = (msg.get("tick_info") or {}).get("current_tick", "?")
 
-            # ── Chronicle: surface recent_events as rich log entries ── #
-            # The server sends a rolling buffer of up to 50 events.
-            # We only log events from ticks we haven't seen yet.
-            self._log_chronicle_events(
-                msg.get("recent_events", []),
-                current_tick,
-                last_logged_event_tick,
-            )
-            if isinstance(current_tick, int):
-                last_logged_event_tick = current_tick
-
-            # Log the outcome of the previous action (chronicle-style)
-            # Only log once per result to avoid repeating the same line
-            # when the server echoes last_action_result across ticks.
-            last_result = msg.get("last_action_result")
-            result_tick = last_result.get("tick") if last_result else None
-            if last_result and result_tick != last_logged_result_tick:
-                last_logged_result_tick = result_tick
-                status = last_result.get("status", "")
-                icon = {"success": "✓", "partial": "~"}.get(status, "✗")
-                action_name = last_result.get("action", "?")
-                summary = last_result.get("summary", "")
-                details = last_result.get("details")
-                detail_str = ""
-                if details:
-                    detail_str = " | " + " ".join(f"{k}={v}" for k, v in details.items())
-                # Result belongs to the previous tick's action
-                prev_tick = current_tick - 1 if isinstance(current_tick, int) else "?"
-                logger.info(
-                    "Result (tick %s): %s %s → %s %s%s",
-                    prev_tick, icon, action_name, status.upper(), summary, detail_str,
+            # Logging what happened must never stop the agent answering: an
+            # error here used to end this task while the reader kept the
+            # connection looking healthy.
+            try:
+                # ── Chronicle: surface recent_events as rich log entries ── #
+                # The server sends a rolling buffer of up to 50 events.
+                # We only log events from ticks we haven't seen yet.
+                self._log_chronicle_events(
+                    msg.get("recent_events", []),
+                    current_tick,
+                    last_logged_event_tick,
                 )
+                if isinstance(current_tick, int):
+                    last_logged_event_tick = current_tick
+
+                # Log the outcome of the previous action (chronicle-style)
+                # Only log once per result to avoid repeating the same line
+                # when the server echoes last_action_result across ticks.
+                last_result = msg.get("last_action_result")
+                result_tick = last_result.get("tick") if last_result else None
+                if last_result and result_tick != last_logged_result_tick:
+                    last_logged_result_tick = result_tick
+                    status = last_result.get("status", "")
+                    icon = {"success": "✓", "partial": "~"}.get(status, "✗")
+                    action_name = last_result.get("action", "?")
+                    summary = last_result.get("summary", "")
+                    details = last_result.get("details")
+                    detail_str = ""
+                    if details:
+                        detail_str = " | " + " ".join(f"{k}={v}" for k, v in details.items())
+                    # Result belongs to the previous tick's action
+                    prev_tick = current_tick - 1 if isinstance(current_tick, int) else "?"
+                    logger.info(
+                        "Result (tick %s): %s %s → %s %s%s",
+                        prev_tick, icon, action_name, status.upper(), summary, detail_str,
+                    )
+            except Exception:
+                logger.debug("Could not log the events of tick %s", current_tick, exc_info=True)
 
             self._in_turn = True
             try:
@@ -481,6 +487,11 @@ class TNEClient:
                             "The action for tick %s is late: a newer state has already "
                             "arrived. Sending it anyway.", current_tick,
                         )
+                        # It will run on the tick after the one it answers. Noted
+                        # now, not when the server confirms: the next turn may
+                        # start before the confirmation is read.
+                        if isinstance(current_tick, int):
+                            self.late_action_runs_on = current_tick + 1
                     await ws.send(json.dumps(action))
                 if self._after_turn is not None:
                     # The action is on its way; this no longer holds it up.

@@ -73,3 +73,28 @@ def test_thinking_left_on_by_choice_is_left_alone():
     _ask(provider, thinking=True)
     _ask(provider, thinking=True)
     assert all("reasoning_effort" not in b for b in bodies)
+
+
+def test_a_400_for_another_reason_does_not_switch_the_switch_off():
+    import json
+    bodies, fail = [], {"on": False}
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if fail["on"]:
+            return httpx.Response(400, json={"error": "context length exceeded"})
+        return _answer(None if body.get("reasoning_effort") == "none" else "long thoughts")
+
+    provider = _provider(handler)
+    _ask(provider)                      # reasons: the switch is used from now on
+    _ask(provider)
+    fail["on"] = True
+    try:
+        _ask(provider)
+        raise AssertionError("the real error must be raised")
+    except httpx.HTTPStatusError:
+        pass
+    fail["on"] = False
+    _ask(provider)
+    assert bodies[-1].get("reasoning_effort") == "none"       # still asked: the server does accept it

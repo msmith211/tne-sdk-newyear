@@ -284,6 +284,7 @@ class _GameAPI:
         }
         self.last_tick: int | None = None      # the tick of the state last read
         self._catalog: dict | None = None
+        self._catalog_etag: str | None = None
 
     def get_state(self, full: bool = False) -> dict:
         """The agent's state: lean by default, the full one on request.
@@ -306,12 +307,16 @@ class _GameAPI:
         return state
 
     def get_catalog(self, section: str | None = None) -> dict:
-        """The game catalogue, or one part of it. Read once and kept."""
+        """The game catalogue, or one part of it. Kept, and read again only when it has changed."""
         import httpx
-        if self._catalog is None:
-            resp = httpx.get(f"{self.base_url}/v1/agent/catalog", headers=self.headers, timeout=15.0)
+        headers = dict(self.headers)
+        if self._catalog is not None and self._catalog_etag:
+            headers["If-None-Match"] = self._catalog_etag
+        resp = httpx.get(f"{self.base_url}/v1/agent/catalog", headers=headers, timeout=15.0)
+        if resp.status_code != 304 or self._catalog is None:
             _check_response(resp)
             self._catalog = resp.json()
+            self._catalog_etag = resp.headers.get("ETag")
         catalog = self._catalog
         if section:
             return {"catalog_version": catalog.get("catalog_version"), section: catalog.get(section)}

@@ -8,6 +8,23 @@ version are also published on the
 
 Season 4 work. Not published.
 
+### Fixed
+
+- **Found in the final review of the Season 4 work.**
+  - Bedrock token counts are reported under the same names as the other
+    providers, so they reach the timing line and the research report.
+  - A model call that fails is reported as `model_error` with no token counts.
+    It used to carry the counts of the previous call, often a reflection.
+    A retry after bad JSON now adds both calls' counts up.
+  - Logging a state's events can no longer stop the agent answering.
+  - The memory mirror is sent every turn until the server's copy matches. It
+    used to be marked as sent even when the action carrying it was turned away.
+  - A 400 from the model server for another reason no longer makes the SDK
+    give up on `reasoning_effort` for the rest of the run.
+  - A late action is noted as soon as it is sent, so the next turn's fallback
+    cannot replace it before the server's confirmation is read.
+  - The MCP server reads the catalogue again when the game says it has changed.
+
 ### Added
 
 - **Research reporting, when the game asks.** A state that carries a

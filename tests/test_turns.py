@@ -216,12 +216,18 @@ class _Model:
         self.delay = delay
         self.prompts = []
         self.calls = []
+        self.usage = None           # what each call reports as its token counts
+        self.fail = False
 
     def chat_completion(self, messages, **kwargs):
         self.prompts.append(messages[-1].content)
         self.calls.append(messages[0].content[:40])
         if self.delay:
             threading.Event().wait(self.delay)
+        if self.fail:
+            raise TimeoutError("model timed out")
+        if self.usage is not None:
+            self.last_usage = dict(self.usage)
         return json.dumps(self.answer)
 
 
@@ -370,13 +376,17 @@ class TestMemoryMirror:
                                     "goals": ["Buy a blade", "Reach level 3"]}
         assert "notes" not in action["memory"]          # the server's notes are left alone
 
-    def test_it_is_not_sent_again_until_it_changes(self):
+    def test_it_is_sent_until_the_server_has_it(self):
         agent = self._agent()
-        assert "memory" in _turn(agent, _playable(7, memory=self._SERVER))
-        assert "memory" not in _turn(agent, _playable(8, memory=self._SERVER))
+        sent = _turn(agent, _playable(7, memory=self._SERVER))["memory"]
+        # The action carrying it was turned away as stale: the server still has the old copy.
+        assert _turn(agent, _playable(8, memory=self._SERVER))["memory"] == sent
+        # Now it arrived.
+        held = {**self._SERVER, "plan": sent["plan"], "goals": sent["goals"]}
+        assert "memory" not in _turn(agent, _playable(9, memory=held))
         agent.memory._tasks.insert(0, {"task_id": 9, "parent_id": None, "status": "pending", "priority": 99,
                                        "description": "Flee the wraith"})
-        assert _turn(agent, _playable(9, memory=self._SERVER))["memory"]["goals"][0] == "Flee the wraith"
+        assert _turn(agent, _playable(10, memory=held))["memory"]["goals"][0] == "Flee the wraith"
 
     def test_nothing_is_sent_when_the_server_already_has_it(self):
         held = {"plan": "Buy a blade | Short of credits.", "goals": ["Buy a blade", "Reach level 3"], "notes": ["x"]}
@@ -500,7 +510,12 @@ class TestMcp:
 
         def fake_get(url, headers=None, params=None, timeout=None):
             calls.append(("GET", url, params))
-            return httpx.Response(200, json=replies[url.rsplit("/", 1)[-1]], request=httpx.Request("GET", url))
+            name = url.rsplit("/", 1)[-1]
+            etag = f'"{json.dumps(replies[name], sort_keys=True).__hash__()}"'
+            if (headers or {}).get("If-None-Match") == etag:
+                return httpx.Response(304, request=httpx.Request("GET", url))
+            return httpx.Response(200, json=replies[name], headers={"ETag": etag},
+                                  request=httpx.Request("GET", url))
 
         def fake_post(url, headers=None, json=None, timeout=None):
             calls.append(("POST", url, json))
@@ -538,15 +553,20 @@ class TestMcp:
         assert calls[-1][2] == {"action": "wait", "reasoning": "r",
                                 "memory": {"plan": "Rest, then trade."}, "based_on_tick": 12}
 
-    def test_the_catalogue_in_parts_and_fetched_once(self, monkeypatch):
+    def test_the_catalogue_in_parts_and_read_again_only_when_it_changes(self, monkeypatch):
         catalog = {**_CATALOG, "rules": {"max_staleness_ticks": 1}, "state_guide": {"tick": "…"},
                    "items": {"consumables": {}}}
-        api, calls = self._api(monkeypatch, {"catalog": catalog})
+        replies = {"catalog": catalog}
+        api, calls = self._api(monkeypatch, replies)
         essentials = json.loads(self._call(monkeypatch, api, "get_catalog")["content"][0]["text"])
         assert set(essentials) == {"catalog_version", "game", "actions", "rules", "state_guide"}
+        kept = api._catalog
         items = json.loads(self._call(monkeypatch, api, "get_catalog", {"section": "items"})["content"][0]["text"])
         assert items == {"catalog_version": "1.0.35+abc", "items": {"consumables": {}}}
-        assert len([c for c in calls if c[1].endswith("/catalog")]) == 1
+        assert api._catalog is kept                      # the server said "not changed": nothing re-read
+        replies["catalog"] = {**catalog, "catalog_version": "1.0.36+def"}      # a deploy mid-session
+        fresh = json.loads(self._call(monkeypatch, api, "get_catalog")["content"][0]["text"])
+        assert fresh["catalog_version"] == "1.0.36+def"
         bad = self._call(monkeypatch, api, "get_catalog", {"section": "secrets"})
         assert bad["isError"] is True and "unknown section" in bad["content"][0]["text"]
 
@@ -625,8 +645,8 @@ class TestClientReport:
 
     def test_a_model_decision_reports_its_model_tokens_and_time(self):
         model = _Model()
-        model.last_usage = {"input_tokens": 3005, "output_tokens": 68, "cache_creation_input_tokens": 1200,
-                            "reasoning_chars": 40}
+        model.usage = {"input_tokens": 3005, "output_tokens": 68, "cache_creation_input_tokens": 1200,
+                       "reasoning_chars": 40}
         agent = _agent(model)
         agent.config.model = "gemma-4-12b"
         report = _turn(agent, _playable(7, **self.ASKED))["client_report"]
@@ -659,11 +679,39 @@ class TestClientReport:
 
     def test_last_turns_tokens_are_not_reported_for_this_one(self):
         model = _Model()
-        model.last_usage = {"output_tokens": 68}
+        model.usage = {"output_tokens": 68}
         agent = _agent(model)
         _turn(agent, _playable(7, **self.ASKED))
         report = _turn(agent, _playable(8, travel=_TRAVEL, **self.ASKED))["client_report"]
         assert "output_tokens" not in report
+
+    def test_a_failed_call_is_not_reported_with_an_earlier_calls_tokens(self):
+        model = _Model()
+        model.usage = {"input_tokens": 9000, "output_tokens": 4000}      # say, a reflection just before
+        agent = _agent(model)
+        _turn(agent, _playable(7, **self.ASKED))
+        model.fail = True
+        action = _turn(agent, _playable(8, **self.ASKED))
+        report = action["client_report"]
+        assert action["action"] == "wait" and report["decision_source"] == "model_error"
+        assert "output_tokens" not in report and "input_tokens" not in report and "decision_source" not in action
+
+    def test_a_retry_after_bad_json_adds_both_calls_up(self):
+        class Garbled(_Model):
+            def chat_completion(self, messages, **kwargs):
+                text = super().chat_completion(messages, **kwargs)
+                return "not json at all" if len(self.prompts) == 1 else text
+
+        model = Garbled()
+        model.usage = {"input_tokens": 3000, "output_tokens": 60}
+        report = _turn(_agent(model), _playable(7, **self.ASKED))["client_report"]
+        assert (report["input_tokens"], report["output_tokens"]) == (6000, 120) and len(model.prompts) == 2
+
+    def test_bedrock_counts_are_read(self):
+        report = turns.client_report(self.ASKED, sdk_version="1", model="m", decision_source="model",
+                                     usage={"input_tokens": 1200, "output_tokens": 80,
+                                            "cache_write_input_tokens": 900})
+        assert (report["input_tokens"], report["output_tokens"], report["cache_write_input_tokens"]) == (1200, 80, 900)
 
     def test_the_template_hash_names_the_template(self):
         assert turns.template_hash("a", "b") == turns.template_hash("a", "b") != turns.template_hash("ab")

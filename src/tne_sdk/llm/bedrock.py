@@ -181,9 +181,13 @@ class BedrockProvider(LLMProvider):
             converse_kwargs["system"] = system_blocks
             response = self._client.converse(**converse_kwargs)
         usage = response.get("usage") or {}
-        self.last_usage = {name: usage[name] for name in (
-            "inputTokens", "outputTokens", "cacheReadInputTokens", "cacheWriteInputTokens",
-        ) if isinstance(usage.get(name), int)}
+        # Under the same names the other providers use, so the timing line and
+        # the research report can read them.
+        self.last_usage = {ours: usage[theirs] for theirs, ours in (
+            ("inputTokens", "input_tokens"), ("outputTokens", "output_tokens"),
+            ("cacheReadInputTokens", "cache_read_input_tokens"),
+            ("cacheWriteInputTokens", "cache_write_input_tokens"),
+        ) if isinstance(usage.get(theirs), int)}
 
         # Extract text from response content blocks
         content_blocks = response["output"]["message"]["content"]

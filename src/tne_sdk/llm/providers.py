@@ -294,12 +294,16 @@ class OpenAICompatibleProvider(LLMProvider):
             body["reasoning_effort"] = "none"
         response = self._http.post(self._completions_url, json=body)
         if effort_switch and response.status_code in (400, 422):
-            self._effort_switch_refused = True
             del body["reasoning_effort"]
-            logger.warning(
-                "This server does not accept reasoning_effort, so the model's thinking cannot be "
-                "switched off from here. Switch it off in the server's own settings for this model.")
-            response = self._http.post(self._completions_url, json=body)
+            again = self._http.post(self._completions_url, json=body)
+            if again.status_code < 400:
+                # Only now is it known that the field was the problem. A 400
+                # for another reason fails again here and is raised below.
+                self._effort_switch_refused = True
+                logger.warning(
+                    "This server does not accept reasoning_effort, so the model's thinking cannot be "
+                    "switched off from here. Switch it off in the server's own settings for this model.")
+            response = again
         response.raise_for_status()
         data = response.json()
         msg = data["choices"][0]["message"]
