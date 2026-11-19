@@ -1950,11 +1950,21 @@ class Agent:
                 valid_terrs = terr_param.get("valid_values", [])
                 current_power = state.get("power", 0)
                 if travel_costs:
+                    # A Season 4 server also sends how long each journey takes, the
+                    # chance of being intercepted on the way, and any other route
+                    # worth weighing. Each is shown only when the server sent it.
+                    travel_ticks = terr_param.get("ticks_per_destination") or {}
+                    travel_risks = terr_param.get("risk_per_destination") or {}
+                    route_options = terr_param.get("route_options") or {}
                     lines.append("  move:")
                     for terr in sorted(travel_costs, key=lambda t: travel_costs[t]):
                         cost = travel_costs[terr]
                         affordable = "✓" if cost <= current_power else "✗ not enough power"
-                        lines.append(f"    - {terr} ({cost} power) {affordable}")
+                        lines.append(f"    - {terr} ({turns.route_costs(cost, travel_ticks.get(terr), travel_risks.get(terr))}) {affordable}")
+                        lines.extend(turns.route_option_lines(route_options.get(terr)))
+                    if route_options:
+                        lines.append('    To take another route listed, add it to the parameters: '
+                                     '{"territory": "...", "prefer": "quickest"}')
                 elif valid_terrs:
                     lines.append(f"  move(territory): {', '.join(valid_terrs)}")
                 else:

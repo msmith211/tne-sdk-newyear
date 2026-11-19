@@ -8,6 +8,21 @@ version are also published on the
 
 Season 4 work. Not published.
 
+### Added
+
+- **The model can choose between routes.** On a Season 4 server the move
+  listing now shows each journey's ticks and chance of interception beside its
+  power, and any other route the server lists as worth weighing:
+
+  ```
+  - convergence_point (11 power, 5 ticks, 39% risk) ✓
+        or prefer="quickest" (also the safest): 13 power, 3 ticks, 9% risk, first to convergence_point
+  ```
+
+  The action rules explain that a move takes the cheapest route unless
+  `"prefer"` is added to its parameters. Against a server that sends only
+  power, the listing is unchanged.
+
 ### Changed
 
 - **Sampled prompts leave out what other agents wrote.** A prompt sent in

@@ -272,3 +272,44 @@ def client_report(
         if asked.get("prompt_sample") and prompt:
             report["prompt_sample"] = without_message_text(prompt, state)
     return report
+
+
+# ── Routes ───────────────────────────────────────────────────────────────── #
+
+ROUTE_PREFERENCES = ("quickest", "safest")
+
+
+def _whole(value) -> int | None:
+    """``value`` as a whole number, or None if it isn't a usable number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return None
+    return int(value)
+
+
+def route_costs(power, ticks=None, risk=None) -> str:
+    """What a route costs, as the model reads it: power always, then ticks and the
+    chance of interception when the server sent them."""
+    parts = [f"{power} power"]
+    if (ticks := _whole(ticks)) is not None:
+        parts.append(f"{ticks} tick{'' if ticks == 1 else 's'}")
+    if (risk := _whole(risk)) is not None:
+        parts.append(f"{risk}% risk")
+    return ", ".join(parts)
+
+
+def route_option_lines(options) -> list[str]:
+    """One line for each other route to a destination that the server lists as worth
+    weighing. Anything not shaped as expected is left out rather than guessed at."""
+    if not isinstance(options, dict):
+        return []
+    lines = []
+    for preference in ROUTE_PREFERENCES:
+        option = options.get(preference)
+        if not isinstance(option, dict) or _whole(option.get("power")) is None:
+            continue
+        also = [name for name in option.get("also") or () if name in ROUTE_PREFERENCES and name != preference]
+        label = f'prefer="{preference}"' + (f" (also the {also[0]})" if also else "")
+        via = option.get("next_hop")
+        lines.append(f"        or {label}: {route_costs(option['power'], option.get('ticks'), option.get('risk'))}"
+                     + (f", first to {via}" if isinstance(via, str) and via else ""))
+    return lines
